@@ -1,0 +1,47 @@
+{
+  "manifest_version": 3,
+  "name": "Play on Volumio",
+  "version": "1.0",
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "description": "Adds a ‘Play on Volumio’ button to albumoftheyear.org.",
+  "permissions": ["storage", "scripting","tabs"],
+  "host_permissions": ["http://*/*", "https://*/*"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "options_page": "options.html",
+  "content_scripts": [
+    {
+      "matches": ["*://www.albumoftheyear.org/album/*"],
+      "js": ["content.js"]
+    },
+    {
+      "matches": ["*://www.albumoftheyear.org/ratings/*","*://www.albumoftheyear.org/list/*"],
+      "js": ["content_ratings.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "*://www.albumoftheyear.org/discover/under-radar/*",
+        "*://www.albumoftheyear.org/discover/",
+        "*://www.albumoftheyear.org/discover/top-rated/*",
+        "*://www.albumoftheyear.org/genre*",
+        "*://www.albumoftheyear.org/must-hear/*",
+        "*://www.albumoftheyear.org/discover/anticipated/*",
+        "*://www.albumoftheyear.org/*/releases/*",
+        "*://www.albumoftheyear.org/releases/*",
+        "*://www.albumoftheyear.org/"
+      ],
+      "js": ["content_discover.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["*://www.albumoftheyear.org/*"],
+      "js": ["content_overlay.js"]
+      }
+  ]
+}
