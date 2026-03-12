@@ -1,5 +1,5 @@
 // =============================================================================
-// Play on Volumio - Discovery Pages (albumoftheyear.org/discover/*, etc.)
+// Play on Volumio - Artist Pages (albumoftheyear.org/artist/*)
 // Adds "Play on Volumio" buttons to album blocks
 // =============================================================================
 
@@ -10,15 +10,17 @@
     return;
   }
 
-  const albumBlocks = document.querySelectorAll("div.albumBlock");
+  const artistElem = document.querySelector("h1.artistHeadline");
+  const albumBlocks = document.querySelectorAll(".albumBlock.small");
+
+  if (!artistElem) return;
+
+  const artist = artistElem.innerText.trim();
 
   albumBlocks.forEach((block) => {
-    const artistElem = block.querySelector("div.artistTitle");
-    const albumElem = block.querySelector("div.albumTitle");
+    const albumElem = block.querySelector(".albumTitle.normal, .albumTitle");
+    if (!albumElem) return;
 
-    if (!artistElem || !albumElem) return;
-
-    const artist = artistElem.innerText.trim();
     const album = albumElem.innerText.trim();
 
     const playButton = document.createElement("button");

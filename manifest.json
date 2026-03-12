@@ -20,6 +20,10 @@
       "js": ["content.js"]
     },
     {
+      "matches": ["*://www.albumoftheyear.org/artist/*"],
+      "js": ["content_artist.js"]
+    },
+    {
       "matches": ["*://www.albumoftheyear.org/ratings/*","*://www.albumoftheyear.org/list/*"],
       "js": ["content_ratings.js"],
       "run_at": "document_idle"
@@ -34,6 +38,7 @@
         "*://www.albumoftheyear.org/discover/anticipated/*",
         "*://www.albumoftheyear.org/*/releases/*",
         "*://www.albumoftheyear.org/releases/*",
+        "*://www.albumoftheyear.org/search/*",
         "*://www.albumoftheyear.org/"
       ],
       "js": ["content_discover.js"],

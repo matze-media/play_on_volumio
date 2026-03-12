@@ -1,14 +1,69 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
   <head>
-    <title>Play on Volumio – Configurations</title>
+    <meta charset="UTF-8" />
+    <title>Play on Volumio – Options</title>
+    <style>
+      body {
+        font-family: system-ui, -apple-system, sans-serif;
+        max-width: 400px;
+        margin: 2rem auto;
+        padding: 0 1rem;
+      }
+      h2 {
+        margin-bottom: 1rem;
+        font-size: 1.25rem;
+      }
+      label {
+        display: block;
+        margin-bottom: 0.5rem;
+        font-weight: 500;
+      }
+      input {
+        display: block;
+        width: 100%;
+        padding: 0.5rem;
+        margin-bottom: 1rem;
+        font-size: 1rem;
+        border: 1px solid #ccc;
+        border-radius: 4px;
+        box-sizing: border-box;
+      }
+      input:focus {
+        outline: none;
+        border-color: #61ce70;
+      }
+      button {
+        padding: 0.5rem 1rem;
+        background: #61ce70;
+        color: white;
+        border: none;
+        border-radius: 6px;
+        font-weight: bold;
+        cursor: pointer;
+      }
+      button:hover {
+        background: #52b861;
+      }
+      .hint {
+        font-size: 0.875rem;
+        color: #666;
+        margin-top: -0.5rem;
+        margin-bottom: 1rem;
+      }
+    </style>
   </head>
   <body>
-    <h2>Volumio-Server Configurations</h2>
-    <label>
-      Volumio IP:
-      <input type="text" id="volumioIp" placeholder="192.168.1.100" />
-    </label>
+    <h2>Play on Volumio – Configuration</h2>
+    <label for="volumioIp">Volumio server IP address</label>
+    <input type="text" id="volumioIp" placeholder="192.168.1.100" />
+    <p class="hint">Your Volumio device IP on the local network (e.g. 192.168.1.100)</p>
+    <label for="volumioApiPort">Volumio API port</label>
+    <input type="number" id="volumioApiPort" placeholder="3000" min="1" max="65535" />
+    <p class="hint">Port for REST API and WebSocket (default: 3000)</p>
+    <label for="volumioWebPort">Volumio Web UI port (optional)</label>
+    <input type="number" id="volumioWebPort" placeholder="8080" min="1" max="65535" />
+    <p class="hint">Port from the browser address bar when Volumio is open. Use 80 for http://192.168.1.100 (no port shown), or e.g. 8080 for http://192.168.1.100:8080. Leave empty to use API port.</p>
     <button id="save">Save</button>
 
     <script src="options.js"></script>
