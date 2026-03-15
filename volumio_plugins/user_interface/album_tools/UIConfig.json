@@ -1,0 +1,73 @@
+{
+  "page": {
+    "label": "Album Tools"
+  },
+  "sections": [
+    {
+      "id": "section_similar_albums",
+      "element": "section",
+      "label": "Similar Albums",
+      "icon": "fa-music",
+      "onSave": {
+        "type": "controller",
+        "endpoint": "user_interface/album_tools",
+        "method": "updateConfig"
+      },
+      "saveButton": {
+        "label": "Save",
+        "data": ["lastfmApiKey", "similarArtistsLimit", "maxSimilarAlbums"]
+      },
+      "content": [
+        {
+          "id": "lastfmApiKey",
+          "type": "text",
+          "element": "input",
+          "label": "Last.fm API Key",
+          "doc": "Required for similar artist lookups. Get a free key at https://www.last.fm/api/account/create",
+          "value": ""
+        },
+        {
+          "id": "similarArtistsLimit",
+          "type": "number",
+          "element": "input",
+          "label": "Similar artists limit",
+          "doc": "Max similar artists from Last.fm (5-50)",
+          "value": 15
+        },
+        {
+          "id": "maxSimilarAlbums",
+          "type": "number",
+          "element": "input",
+          "label": "Max similar albums to return",
+          "doc": "Max albums in API response (1-200)",
+          "value": 50
+        }
+      ]
+    },
+    {
+      "id": "section_recently_added",
+      "element": "section",
+      "label": "Recently Added Albums",
+      "icon": "fa-clock-o",
+      "onSave": {
+        "type": "controller",
+        "endpoint": "user_interface/album_tools",
+        "method": "updateConfig"
+      },
+      "saveButton": {
+        "label": "Save",
+        "data": ["maxRecentlyAddedAlbums"]
+      },
+      "content": [
+        {
+          "id": "maxRecentlyAddedAlbums",
+          "type": "number",
+          "element": "input",
+          "label": "Max recently added albums",
+          "doc": "Max albums in API response (1-200)",
+          "value": 20
+        }
+      ]
+    }
+  ]
+}

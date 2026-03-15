@@ -1,0 +1,18 @@
+{
+  "lastfmApiKey": {
+    "type": "string",
+    "value": ""
+  },
+  "similarArtistsLimit": {
+    "type": "number",
+    "value": 15
+  },
+  "maxSimilarAlbums": {
+    "type": "number",
+    "value": 50
+  },
+  "maxRecentlyAddedAlbums": {
+    "type": "number",
+    "value": 20
+  }
+}

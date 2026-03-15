@@ -1,0 +1,29 @@
+{
+  "name": "album_tools",
+  "version": "1.0.0",
+  "description": "Album Tools: Similar Albums and Recently Added Albums. Uses Last.fm API and MPD library.",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "author": "",
+  "license": "GPL-3.0",
+  "volumio_info": {
+    "prettyName": "Album Tools",
+    "icon": "fa-music",
+    "plugin_type": "user_interface",
+    "architectures": ["amd64", "armhf", "arm"],
+    "os": ["buster", "bullseye", "bookworm"],
+    "details": "Similar Albums (Last.fm) and Recently Added Albums (MPD). Two REST endpoints for album discovery.",
+    "changelog": "Initial release - merges Similar Albums and Recently Added Albums"
+  },
+  "engines": {
+    "node": ">=14",
+    "volumio": ">=3"
+  },
+  "dependencies": {
+    "mpd": "^1.3.0",
+    "kew": "^0.7.0",
+    "v-conf": "^1.4.0"
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "SIMILAR_ALBUMS": "Similar Albums",
+  "lastfmApiKey": "Last.fm API Key",
+  "similarArtistsLimit": "Similar artists limit",
+  "maxSimilarAlbums": "Max similar albums to return",
+  "RECENTLY_ADDED": "Recently Added Albums",
+  "maxRecentlyAddedAlbums": "Max recently added albums"
+}
