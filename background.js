@@ -124,7 +124,7 @@ function isVolumioTabUrl(url) {
 function injectOverlayIntoVolumioTab(tabId) {
   if (!volumioIp) return;
   chrome.scripting
-    .executeScript({ target: { tabId }, files: ["content_overlay.js"] })
+    .executeScript({ target: { tabId }, files: ["content_overlay.js", "content_volumio.js"] })
     .then(() => console.log("[Play on Volumio] Injected into tab", tabId))
     .catch((err) => console.warn("[Play on Volumio] Injection failed:", err));
 }
@@ -190,13 +190,14 @@ chrome.runtime.onConnect.addListener((port) => {
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   // --- getAlbumArt: Proxy image fetch to avoid Referrer Policy / mixed content ---
   if (msg.action === "getAlbumArt") {
-    const url = msg.url;
+    let url = msg.url;
     if (!url || !volumioIp) {
       sendResponse(null);
       return false;
     }
-    const allowedPrefix = getBaseUrl();
-    if (url !== allowedPrefix && !url.startsWith(allowedPrefix + "/")) {
+    const baseUrl = getBaseUrl();
+    if (url.startsWith("/")) url = baseUrl + url;
+    if (url !== baseUrl && !url.startsWith(baseUrl + "/")) {
       sendResponse(null);
       return false;
     }
@@ -256,6 +257,23 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         });
 
         sendResponse({ success: true, message: `Playing ${msg.album} by ${msg.artist}` });
+        return;
+      }
+
+      // --- Plugin endpoints: similar_albums, recently_added_albums ---
+      if (msg.action === "getSimilarAlbums") {
+        const res = await fetch(`${baseUrl}/api/v1/pluginEndpoint?endpoint=similar_albums`);
+        if (!res.ok) throw new Error(`Similar albums failed: ${res.status}`);
+        const data = await res.json();
+        sendResponse(data);
+        return;
+      }
+
+      if (msg.action === "getRecentlyAddedAlbums") {
+        const res = await fetch(`${baseUrl}/api/v1/pluginEndpoint?endpoint=recently_added_albums`);
+        if (!res.ok) throw new Error(`Recently added albums failed: ${res.status}`);
+        const data = await res.json();
+        sendResponse(data);
         return;
       }
 

@@ -37,6 +37,8 @@ A Chrome extension that adds **"Play on Volumio"** buttons to [albumoftheyear.or
 | **Volumio server IP** | Your Volumio device IP (e.g. `192.168.1.100`) |
 | **Volumio API port** | REST API and WebSocket port (default: `3000`) |
 | **Volumio Web UI port** | Optional. Port from the browser when Volumio is open. Use `80` for `http://192.168.1.100`, or `8080` for `http://192.168.1.100:8080`. Leave empty to use the API port. |
+| **Max. similar albums** | Maximum number of similar albums shown in the modal (default: `12`) |
+| **Max. recently added albums** | Maximum number of recently added albums shown in the modal (default: `9`) |
 
 ## Usage
 
