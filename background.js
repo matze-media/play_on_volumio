@@ -260,6 +260,48 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         return;
       }
 
+      // --- playTrack: REST search + replaceAndPlay (same as playAlbum, search for track) ---
+      if (msg.action === "playTrack") {
+        const query = encodeURIComponent(`${msg.artist} ${msg.album} ${msg.track}`);
+        const searchUrl = `${baseUrl}/api/v1/search?query=${query}`;
+
+        const res = await fetch(searchUrl);
+        if (!res.ok) throw new Error(`Search failed: ${res.status}`);
+        const data = await res.json();
+
+        const songs = [];
+        data?.navigation?.lists?.forEach((list) => {
+          list.items?.forEach((item) => {
+            if (item.type === "song") songs.push(item);
+          });
+        });
+
+        const trackLower = (msg.track || "").toLowerCase();
+        const match = songs.find(
+          (s) =>
+            (s.title || "").toLowerCase() === trackLower ||
+            (s.title || "").toLowerCase().includes(trackLower) ||
+            trackLower.includes((s.title || "").toLowerCase())
+        );
+        const toPlay = match || songs[0];
+
+        if (!toPlay || songs.length === 0) {
+          sendResponse({ success: false, error: `No songs found for ${msg.artist} – ${msg.album} – ${msg.track}` });
+          return;
+        }
+
+        const idx = songs.indexOf(toPlay);
+        const payload = { item: toPlay, list: songs, index: idx };
+        await fetch(`${baseUrl}/api/v1/replaceAndPlay`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload)
+        });
+
+        sendResponse({ success: true, message: `Playing ${msg.track} by ${msg.artist}` });
+        return;
+      }
+
       // --- Plugin endpoints: similar_albums, recently_added_albums ---
       if (msg.action === "getSimilarAlbums") {
         const res = await fetch(`${baseUrl}/api/v1/pluginEndpoint?endpoint=similar_albums`);
@@ -280,14 +322,6 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       // --- WebSocket commands (require connected WebSocket) ---
       if (!ws || ws.readyState !== WebSocket.OPEN) {
         sendResponse({ success: false, error: "Volumio WebSocket not connected." });
-        return;
-      }
-
-      if (msg.action === "playTrack") {
-        ws.send(
-          `42["playTrack",${JSON.stringify({ artist: msg.artist, album: msg.album, track: msg.track })}]`
-        );
-        sendResponse({ success: true, message: `${msg.artist} – ${msg.album} – ${msg.track}` });
         return;
       }
 
