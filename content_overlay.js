@@ -34,6 +34,31 @@ function formatTime(sec) {
 let mediaSessionAudio = null;
 let mediaSessionReady = false;
 
+/** When the page becomes hidden (lid close, sleep), Chrome pauses the silent audio and may invoke
+ *  the Media Session pause handler—forwarding that to Volumio wrongly stops playback on the device.
+ *  Skip forwarding pause to Volumio for a short interval right after hide (system suspend).
+ */
+let visibilityHiddenAt = 0;
+const PAUSE_FORWARD_SUPPRESS_MS = 2500;
+
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "hidden") {
+    visibilityHiddenAt = Date.now();
+  } else {
+    visibilityHiddenAt = 0;
+    if (currentTrack) {
+      setupMediaSession();
+      updateMediaSessionMetadata(currentTrack);
+    }
+  }
+});
+
+function shouldForwardMediaPauseToVolumio() {
+  if (document.visibilityState === "visible") return true;
+  if (!visibilityHiddenAt) return true;
+  return Date.now() - visibilityHiddenAt > PAUSE_FORWARD_SUPPRESS_MS;
+}
+
 function setupMediaSession() {
   if (mediaSessionAudio) return;
 
@@ -74,6 +99,9 @@ function setupMediaSession() {
       navigator.mediaSession.playbackState = "paused";
       if (currentTrack) currentTrack.status = "pause";
       syncOverlayPlayPauseButton("pause");
+      if (!shouldForwardMediaPauseToVolumio()) {
+        return;
+      }
       chrome.runtime.sendMessage({ action: "pause" }, (r) => {
         if (!r?.success) {
           mediaSessionAudio?.play();
