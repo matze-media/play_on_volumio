@@ -155,11 +155,11 @@
     "album_tools": {
       "enabled": {
         "type": "boolean",
-        "value": true
+        "value": false
       },
       "status": {
         "type": "string",
-        "value": "STARTED"
+        "value": "STOPPED"
       }
     },
     "websocket": {

@@ -37,18 +37,46 @@ A Chrome extension that adds **"Play on Volumio"** buttons to [albumoftheyear.or
 
 The Similar Albums and Recently Added buttons require the **Album Tools** plugin on your Volumio device.
 
-1. Copy the plugin folder to your Volumio device:
-   ```bash
-   # From this repo, copy volumio_plugins/user_interface/album_tools/
-   # to /data/plugins/user_interface/album_tools/ on your Volumio device
-   ```
-   Use SSH (`ssh volumio@<volumio-ip>`) or SCP to copy the folder.
-2. On the Volumio device, run `npm install` in the plugin directory
-3. Restart Volumio
-4. Enable the plugin: **Plugins → User Interface → Album Tools**
-5. Configure a [Last.fm API key](https://www.last.fm/api/account/create) (free) in the plugin settings for Similar Albums
+Install via the [official Volumio plugin workflow](https://developers.volumio.com/plugins/writing-a-plugin). Do **not** use `volumio plugin init` — the plugin is already in this repo.
 
-See [volumio_plugins/user_interface/album_tools/README.md](volumio_plugins/user_interface/album_tools/README.md) for plugin details and API reference.
+**On the Volumio device** (replace `YOUR_VOLUMIO_IP`, run clone once):
+
+```bash
+ssh volumio@YOUR_VOLUMIO_IP
+git clone https://github.com/volumio/volumio-plugins-sources.git
+```
+
+**On your Mac** (from the root of this repo):
+
+```bash
+cd /path/to/play-on-volumio-extension
+scp -r volumio_plugins/user_interface/album_tools \
+  volumio@YOUR_VOLUMIO_IP:~/volumio-plugins-sources/album_tools
+```
+
+**Back on the Volumio device:**
+
+```bash
+ls ~/volumio-plugins-sources/album_tools/package.json   # must exist
+cd ~/volumio-plugins-sources/album_tools
+npm install
+chmod +x install.sh uninstall.sh
+
+# Required on a fresh Volumio install only (skip when updating):
+sudo mkdir -p /data/plugins/user_interface/album_tools
+sudo chown -R volumio:volumio /data/plugins/user_interface/album_tools
+
+volumio plugin refresh
+volumio vrestart
+```
+
+Then:
+
+1. Enable **Plugins → User Interface → Album Tools**
+2. Set a [Last.fm API key](https://www.last.fm/api/account/create) in the plugin settings (for Similar Albums)
+3. Verify: `curl "http://localhost:3000/api/v1/pluginEndpoint?endpoint=recently_added_albums"`
+
+Full details, update instructions, and API reference: [volumio_plugins/user_interface/album_tools/README.md](volumio_plugins/user_interface/album_tools/README.md).
 
 ## Configuration
 
