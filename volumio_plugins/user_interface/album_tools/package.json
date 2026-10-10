@@ -1,6 +1,6 @@
 {
   "name": "album_tools",
-  "version": "1.0.0",
+  "version": "1.2.0",
   "description": "Album Tools: Similar Albums and Recently Added Albums. Uses Last.fm API and MPD library.",
   "main": "index.js",
   "scripts": {
@@ -15,7 +15,7 @@
     "architectures": ["amd64", "armhf", "arm"],
     "os": ["buster", "bullseye", "bookworm"],
     "details": "Similar Albums (Last.fm) and Recently Added Albums (MPD). Two REST endpoints for album discovery.",
-    "changelog": "Initial release - merges Similar Albums and Recently Added Albums"
+    "changelog": "1.2.0 Read the ByteFM player cover from the song-history websocket. The HTTP song list is blocked on the device, so Volumio was left without the cover the player shows."
   },
   "engines": {
     "node": ">=14",

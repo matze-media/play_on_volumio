@@ -24,6 +24,155 @@ function buildAlbumartUrl(albumart) {
   return getBaseUrl() + (albumart.startsWith("/") ? "" : "/") + albumart;
 }
 
+function toNowPlaying(payload) {
+  return {
+    artist: payload.artist || "",
+    album: payload.album || "",
+    title: payload.title || "",
+    duration: payload.duration || 0,
+    seek: payload.seek || 0,
+    status: payload.status || "pause",
+    volume: payload.volume || 0,
+    stream: payload.stream === true,
+    service: payload.service || "",
+    trackType: payload.trackType || "",
+    uri: payload.uri || "",
+    albumart: buildAlbumartUrl(payload.albumart)
+  };
+}
+
+function isAllowedBytefmUri(uri) {
+  try {
+    const url = new URL(uri);
+    if (url.protocol !== "https:") return false;
+    return url.hostname === "www.byte.fm" || url.hostname === "archiv.bytefm.com";
+  } catch {
+    return false;
+  }
+}
+
+const BYTEFM_LOGO = "/albumart?sourceicon=user_interface/album_tools/bytefm-logo.jpg";
+
+function isBytefmCoverUrl(uri) {
+  try {
+    const url = new URL(uri);
+    if (url.protocol !== "https:") return false;
+    const host = url.hostname.toLowerCase();
+    return host === "www.byte.fm" || host.endsWith(".byte.fm");
+  } catch {
+    return false;
+  }
+}
+
+function trackFields(msg) {
+  const title = typeof msg.title === "string" ? msg.title.trim() : "";
+  const artist = typeof msg.artist === "string" ? msg.artist.trim() : "";
+  const album = typeof msg.album === "string" ? msg.album.trim() : "";
+  const supplied = typeof msg.albumart === "string" ? msg.albumart.trim() : "";
+  const albumart = isBytefmCoverUrl(supplied) ? supplied : BYTEFM_LOGO;
+  return { title, artist, album, albumart };
+}
+
+function isPublicHttps(uri) {
+  try {
+    const url = new URL(uri);
+    if (url.protocol !== "https:") return false;
+    const host = url.hostname.toLowerCase();
+    if (host === "localhost" || host.endsWith(".local") || host === "::1") return false;
+    if (/^(127\.|10\.|192\.168\.|0\.|169\.254\.)/.test(host)) return false;
+    if (/^172\.(1[6-9]|2\d|3[0-1])\./.test(host)) return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function withTimeout(promise, ms, message) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(message)), ms);
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (err) => {
+        clearTimeout(timer);
+        reject(err);
+      }
+    );
+  });
+}
+
+// www.byte.fm/live answers with redirects. HEAD follows them and stops at the
+// audio URL, without holding the endless MP3 open.
+async function resolveBytefmStreamUrl(uri) {
+  if (!isPublicHttps(uri)) throw new Error("Stream URL is not a public https address.");
+  const res = await withTimeout(
+    fetch(uri, { method: "HEAD", redirect: "follow" }),
+    8000,
+    "Could not reach the ByteFM stream."
+  );
+  const finalUrl = res.url || uri;
+  if (!isPublicHttps(finalUrl)) throw new Error("Stream URL is not a public https address.");
+  return finalUrl;
+}
+
+async function waitForBytefmPlayback(baseUrl, playbackUri, title) {
+  let host = "";
+  try {
+    host = new URL(playbackUri).hostname;
+  } catch {
+    host = "";
+  }
+  const deadline = Date.now() + 8000;
+  while (Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    try {
+      const res = await fetch(`${baseUrl}/api/v1/getState`);
+      if (!res.ok) continue;
+      const state = await res.json();
+      const stateUri = String(state.uri || "");
+      const stateTitle = String(state.title || state.name || "");
+      const playing = state.status === "play";
+      const sameStream = (host && stateUri.includes(host)) || /byte\.?fm|radiohost\.de/i.test(stateUri);
+      const sameTitle = !!title && stateTitle === title;
+      if (playing && (sameStream || sameTitle)) return true;
+    } catch {
+      /* keep polling until the deadline */
+    }
+  }
+  return false;
+}
+
+async function pushBytefmNowPlaying(baseUrl, info) {
+  let lastError = "Could not update track information.";
+  for (let attempt = 0; attempt < 3; attempt++) {
+    if (attempt) await new Promise((resolve) => setTimeout(resolve, 400));
+    try {
+      const res = await fetch(`${baseUrl}/api/v1/pluginEndpoint`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ endpoint: "bytefm_now_playing", data: info }),
+        signal: AbortSignal.timeout(5000)
+      });
+      let json = null;
+      try {
+        json = await res.json();
+      } catch {
+        json = null;
+      }
+      if (res.ok && json && json.success !== false) return { success: true };
+      lastError = (json && (json.error || json.message)) || lastError;
+      if (/Plugin REST Endpoint/i.test(String(lastError))) break;
+    } catch (err) {
+      lastError = err.name === "TimeoutError" || err.name === "AbortError"
+        ? "Track information update timed out."
+        : err.message || lastError;
+    }
+  }
+  return { success: false, error: lastError };
+}
+
 // -----------------------------------------------------------------------------
 // Volumio WebSocket Connection
 // -----------------------------------------------------------------------------
@@ -59,16 +208,7 @@ function connectVolumio() {
 
       if (eventName === "pushState") {
         lastState = payload;
-        const info = {
-          artist: payload.artist || "",
-          album: payload.album || "",
-          title: payload.title || "",
-          duration: payload.duration || 0,
-          seek: payload.seek || 0,
-          status: payload.status || "pause",
-          volume: payload.volume || 0,
-          albumart: buildAlbumartUrl(payload.albumart)
-        };
+        const info = toNowPlaying(payload);
         ports.forEach((port) => port.postMessage({ action: "nowPlaying", data: info }));
       }
     } catch (err) {
@@ -162,19 +302,7 @@ chrome.runtime.onConnect.addListener((port) => {
       .then((res) => res.json())
       .then((state) => {
         lastState = state;
-        port.postMessage({
-          action: "nowPlaying",
-          data: {
-            artist: state.artist || "",
-            album: state.album || "",
-            title: state.title || "",
-            duration: state.duration || 0,
-            seek: state.seek || 0,
-            status: state.status || "pause",
-            volume: state.volume || 0,
-            albumart: buildAlbumartUrl(state.albumart)
-          }
-        });
+        port.postMessage({ action: "nowPlaying", data: toNowPlaying(state) });
       })
       .catch((err) => console.warn("[Play on Volumio] Failed to get state:", err));
   }
@@ -319,15 +447,118 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         return;
       }
 
-      // --- WebSocket commands (require connected WebSocket) ---
-      if (!ws || ws.readyState !== WebSocket.OPEN) {
-        sendResponse({ success: false, error: "Volumio WebSocket not connected." });
+      // --- ByteFM: REST replaceAndPlay. Must stay before the WebSocket gate. ---
+      if (msg.action === "playOnVolumio") {
+        const uri = typeof msg.uri === "string" ? msg.uri.trim() : "";
+        const title = typeof msg.title === "string" ? msg.title.trim() : "";
+        if (!uri || !title) {
+          sendResponse({ success: false, error: "Missing stream URI or title." });
+          return;
+        }
+        if (!isAllowedBytefmUri(uri)) {
+          sendResponse({ success: false, error: "Stream URL is not a ByteFM address." });
+          return;
+        }
+        const playbackUri = await resolveBytefmStreamUrl(uri);
+        const track = trackFields(msg);
+        const playRes = await fetch(`${baseUrl}/api/v1/replaceAndPlay`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            service: "webradio",
+            type: "webradio",
+            title: track.title || title,
+            name: track.title || title,
+            artist: track.artist,
+            album: track.album,
+            albumart: BYTEFM_LOGO,
+            uri: playbackUri
+          })
+        });
+        const bodyText = await playRes.text();
+        let body = null;
+        try {
+          body = JSON.parse(bodyText);
+        } catch {
+          body = null;
+        }
+        if (!playRes.ok || (body && body.error)) {
+          sendResponse({
+            success: false,
+            error: (body && body.error) || bodyText || `Playback failed: ${playRes.status}`
+          });
+          return;
+        }
+        const started = await waitForBytefmPlayback(baseUrl, playbackUri, title);
+        if (!started) {
+          sendResponse({
+            success: false,
+            error: "Volumio accepted the stream but did not start playing."
+          });
+          return;
+        }
+        const trackInfo = track.title ? track : { ...track, title };
+        sendResponse({
+          success: true,
+          message: `Playing ${title}`,
+          uri: playbackUri
+        });
+        // The Volumio button only starts the live stream. Album Tools on the
+        // device polls ByteFM and updates the song for every client.
+        if (msg.followStream) return;
+        // Playback is already running. Updating the label must not keep this
+        // response open, or the page reports that Volumio did not respond.
+        pushBytefmNowPlaying(baseUrl, trackInfo).then((meta) => {
+          if (!meta.success) console.warn("[Play on Volumio]", meta.error);
+        }).catch((err) => {
+          console.warn("[Play on Volumio]", err.message || err);
+        });
         return;
       }
 
-      if (msg.action === "pause") {
-        ws.send('42["pause",{}]');
-        sendResponse({ success: true, message: "Paused at seek: " + (lastState?.seek || 0) });
+      if (msg.action === "updateBytefmNowPlaying") {
+        const track = trackFields(msg);
+        if (!track.title && !track.artist && !track.albumart) {
+          sendResponse({ success: false, error: "No track information." });
+          return;
+        }
+        const meta = await pushBytefmNowPlaying(baseUrl, track);
+        sendResponse(meta);
+        return;
+      }
+
+      // Live webradio ignores pause. Stop ends it. Always hit REST as well:
+      // a WebSocket that only looks open can accept the message and still leave the stream playing.
+      if (msg.action === "pause" || msg.action === "stop") {
+        let wsSent = false;
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          try {
+            ws.send(`42["${msg.action}",{}]`);
+            wsSent = true;
+          } catch (err) {
+            console.warn("[Play on Volumio] WebSocket " + msg.action + " failed:", err);
+          }
+        }
+        let restOk = false;
+        let restError = "";
+        try {
+          const cmdRes = await fetch(`${baseUrl}/api/v1/commands/?cmd=${msg.action}`);
+          restOk = cmdRes.ok;
+          if (!cmdRes.ok) restError = (await cmdRes.text()) || `Command failed: ${cmdRes.status}`;
+        } catch (err) {
+          restError = err.message;
+        }
+        if (!wsSent && !restOk) {
+          sendResponse({ success: false, error: restError || "Volumio is not connected." });
+          return;
+        }
+        sendResponse({ success: true, message: msg.action });
+        return;
+      }
+
+      // --- WebSocket commands (require connected WebSocket) ---
+      if (!ws || ws.readyState !== WebSocket.OPEN) {
+        sendResponse({ success: false, error: "Volumio WebSocket not connected." });
         return;
       }
 

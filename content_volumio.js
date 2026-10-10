@@ -52,7 +52,12 @@
   buttonRecentlyAdded.id = "volumio-recently-added-btn";
   buttonRecentlyAdded.style.cssText = buttonStyle;
 
-  [button, buttonRecentlyAdded].forEach((btn) => {
+  const buttonBytefm = document.createElement("button");
+  buttonBytefm.textContent = "Play ByteFM";
+  buttonBytefm.id = "volumio-bytefm-btn";
+  buttonBytefm.style.cssText = buttonStyle;
+
+  [button, buttonRecentlyAdded, buttonBytefm].forEach((btn) => {
     btn.addEventListener("mouseenter", () => { btn.style.background = "#52b861"; });
     btn.addEventListener("mouseleave", () => { btn.style.background = ACCENT; });
   });
@@ -66,6 +71,7 @@
     display: flex;
     gap: 8px;
   `;
+  buttonContainer.appendChild(buttonBytefm);
   buttonContainer.appendChild(buttonRecentlyAdded);
   buttonContainer.appendChild(button);
 
@@ -438,8 +444,43 @@
   // ---------------------------------------------------------------------------
   // Event handlers
   // ---------------------------------------------------------------------------
+  const BYTEFM_LIVE = "https://www.byte.fm/live/mp3-320/";
+
+  function playBytefm() {
+    if (buttonBytefm.disabled) return;
+    buttonBytefm.disabled = true;
+    buttonBytefm.textContent = "Starting ByteFM…";
+    buttonBytefm.title = "";
+    try {
+      chrome.runtime.sendMessage({
+        action: "playOnVolumio",
+        uri: BYTEFM_LIVE,
+        title: "ByteFM",
+        artist: "",
+        album: "ByteFM",
+        albumart: "",
+        followStream: true
+      }, (response) => {
+        buttonBytefm.disabled = false;
+        buttonBytefm.textContent = "Play ByteFM";
+        if (chrome.runtime.lastError) {
+          buttonBytefm.title = chrome.runtime.lastError.message;
+          return;
+        }
+        if (!response?.success) {
+          buttonBytefm.title = response?.error || "Could not start ByteFM.";
+        }
+      });
+    } catch (err) {
+      buttonBytefm.disabled = false;
+      buttonBytefm.textContent = "Play ByteFM";
+      buttonBytefm.title = err.message || "Extension was reloaded. Refresh this page.";
+    }
+  }
+
   button.addEventListener("click", showModal);
   buttonRecentlyAdded.addEventListener("click", showModalRecentlyAdded);
+  buttonBytefm.addEventListener("click", playBytefm);
 
   closeBtn.addEventListener("click", hideModal);
 

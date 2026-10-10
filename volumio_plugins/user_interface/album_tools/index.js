@@ -4,8 +4,11 @@ const libQ = require('kew');
 const mpd = require('mpd');
 const cmd = mpd.cmd;
 const http = require('http');
+const https = require('https');
+const crypto = require('crypto');
 const fs = require('fs-extra');
 const path = require('path');
+const { execFile } = require('child_process');
 const vConf = require('v-conf');
 const writeFileAtomicSync = require('write-file-atomic').sync;
 
@@ -52,13 +55,618 @@ ControllerAlbumTools.prototype.onStart = function () {
     method: 'getRecentlyAddedAlbums'
   });
 
+  this.commandRouter.addPluginRestEndpoint({
+    endpoint: 'bytefm_now_playing',
+    type: 'user_interface',
+    name: 'album_tools',
+    method: 'setBytefmNowPlaying'
+  });
+
   this.logger.info('[AlbumTools] Plugin started, REST endpoints registered');
+  self.bytefmLiveKey = '';
+  self.bytefmLiveTimer = setInterval(function () {
+    self.pollBytefmLive();
+  }, 10000);
+  self.pollBytefmLive();
   return resolve();
 };
 
+function isBytefmPlaybackUri(uri) {
+  const value = String(uri || '');
+  if (/byte\.?fm|radiohost\.de/i.test(value)) return true;
+  try {
+    const host = new URL(value).hostname.toLowerCase();
+    return host === 'www.byte.fm' || host === 'archiv.bytefm.com' || host.endsWith('.byte.fm') || host.endsWith('.radiohost.de');
+  } catch (e) {
+    return false;
+  }
+}
+
+function looksLikeFileName(value) {
+  return /\.(mp3|aac|ogg|flac)(\?|$)/i.test(value) || /^[0-9a-f-]{16,}(\.mp3)?$/i.test(value);
+}
+
+const BYTEFM_LOGO = '/albumart?sourceicon=user_interface/album_tools/bytefm-logo.jpg';
+
+function isBytefmLiveUri(uri) {
+  const value = String(uri || '');
+  if (/archiv\.bytefm\.com/i.test(value)) return false;
+  return /byte\.fm/i.test(value) || /radiohost\.de/i.test(value);
+}
+
+const BYTEFM_LIVE_CHANNEL = 'web';
+const BYTEFM_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+const BYTEFM_COVER_FILE = 'bytefm-cover.jpg';
+const BYTEFM_COVER_SOURCE = 'user_interface/album_tools/' + BYTEFM_COVER_FILE;
+
+function decodeHtml(value) {
+  const named = { ndash: '–', mdash: '—', amp: '&', quot: '"', apos: "'", lt: '<', gt: '>', nbsp: ' ' };
+  return String(value || '')
+    .replace(/&(#x?[0-9a-f]+|[a-z]+);/gi, function (entity, body) {
+      if (body.charAt(0) === '#') {
+        const hex = body.charAt(1) === 'x' || body.charAt(1) === 'X';
+        const code = parseInt(body.slice(hex ? 2 : 1), hex ? 16 : 10);
+        return isFinite(code) ? String.fromCodePoint(code) : entity;
+      }
+      const key = body.toLowerCase();
+      return Object.prototype.hasOwnProperty.call(named, key) ? named[key] : entity;
+    })
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function splitBytefmTrack(value) {
+  const text = decodeHtml(value);
+  const parts = text.split(/\s+[–—-]\s+/);
+  if (parts.length >= 2) return { artist: parts[0], title: parts.slice(1).join(' – ') };
+  return { artist: '', title: text };
+}
+
+function bytefmCover(src) {
+  const text = String(src || '').trim();
+  if (!text || /blank\.png/i.test(text)) return '';
+  try {
+    const url = new URL(text, 'https://www.byte.fm/');
+    const host = url.hostname.toLowerCase();
+    if (url.protocol !== 'https:' || (host !== 'www.byte.fm' && !host.endsWith('.byte.fm'))) return '';
+    if (/blank\.png/i.test(url.pathname)) return '';
+    return url.href;
+  } catch (e) {
+    return '';
+  }
+}
+
+function bytefmChannel(field) {
+  if (!field || typeof field !== 'object') return '';
+  const value = field[BYTEFM_LIVE_CHANNEL];
+  return value == null ? '' : value;
+}
+
+function coverToken(url) {
+  let hash = 0;
+  const text = String(url || '');
+  for (let i = 0; i < text.length; i++) hash = ((hash << 5) - hash + text.charCodeAt(i)) | 0;
+  return (hash >>> 0).toString(36);
+}
+
+function localBytefmCover(url) {
+  return '/albumart?sourceicon=' + BYTEFM_COVER_SOURCE + '&v=' + coverToken(url);
+}
+
+function runConverter(bin, args) {
+  return new Promise(function (resolve, reject) {
+    execFile(bin, args, function (err) {
+      if (err) reject(err);
+      else resolve();
+    });
+  });
+}
+
+// The ESP32 decoder only accepts a baseline JPEG. Last.fm covers are often
+// progressive JPEG or PNG, and a browser still displays those.
+function writeCoverAsJpeg(buffer, dest) {
+  const tmp = dest + '.bin';
+  writeFileAtomicSync(tmp, buffer);
+  const ffmpegArgs = ['-y', '-loglevel', 'error', '-i', tmp, '-pix_fmt', 'yuvj420p', '-q:v', '5', dest];
+  return runConverter('/usr/bin/ffmpeg', ffmpegArgs)
+    .catch(function () { return runConverter('ffmpeg', ffmpegArgs); })
+    .catch(function () {
+      return runConverter('/usr/bin/convert', [tmp, '-interlace', 'None', '-sampling-factor', '4:2:0', '-quality', '85', 'jpeg:' + dest]);
+    })
+    .catch(function () {
+      return runConverter('convert', [tmp, '-interlace', 'None', '-sampling-factor', '4:2:0', '-quality', '85', 'jpeg:' + dest]);
+    })
+    .then(function () {
+      fs.removeSync(tmp);
+    }, function () {
+      try { fs.removeSync(tmp); } catch (e) {}
+      if (buffer.length >= 3 && buffer[0] === 0xFF && buffer[1] === 0xD8 && buffer[2] === 0xFF) {
+        writeFileAtomicSync(dest, buffer);
+        return;
+      }
+      throw new Error('Cover is not a JPEG and could not be converted.');
+    });
+}
+
+function writeWsFrame(socket, opcode, payload) {
+  const data = Buffer.isBuffer(payload) ? payload : Buffer.from(payload);
+  const mask = crypto.randomBytes(4);
+  const head = [0x80 | opcode];
+  if (data.length < 126) {
+    head.push(0x80 | data.length);
+  } else if (data.length < 65536) {
+    head.push(0x80 | 126, data.length >> 8, data.length & 0xff);
+  } else {
+    return;
+  }
+  const masked = Buffer.alloc(data.length);
+  for (let i = 0; i < data.length; i++) masked[i] = data[i] ^ mask[i % 4];
+  socket.write(Buffer.concat([Buffer.from(head), mask, masked]));
+}
+
+// www.byte.fm answers the song list on this socket. The same JSON over HTTP
+// is stopped by a browser check, so the device never saw the cover the player shows.
+function readBytefmSongHistory() {
+  return new Promise(function (resolve, reject) {
+    let settled = false;
+    let timer = null;
+    const done = function (err, value) {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      if (err) reject(err);
+      else resolve(value);
+    };
+    const req = https.request({
+      host: 'www.byte.fm',
+      path: '/ws/song-history/',
+      method: 'GET',
+      headers: {
+        Connection: 'Upgrade',
+        Upgrade: 'websocket',
+        'Sec-WebSocket-Version': '13',
+        'Sec-WebSocket-Key': crypto.randomBytes(16).toString('base64'),
+        Origin: 'https://www.byte.fm',
+        'User-Agent': BYTEFM_UA
+      },
+      timeout: 8000
+    });
+    timer = setTimeout(function () {
+      req.destroy();
+      done(new Error('ByteFM song history timed out.'));
+    }, 8000);
+    req.on('upgrade', function (res, socket) {
+      let raw = Buffer.alloc(0);
+      let text = Buffer.alloc(0);
+      socket.on('data', function (chunk) {
+        raw = Buffer.concat([raw, chunk]);
+        while (raw.length >= 2) {
+          const opcode = raw[0] & 0x0f;
+          const fin = (raw[0] & 0x80) !== 0;
+          let len = raw[1] & 0x7f;
+          let offset = 2;
+          if (len === 126) {
+            if (raw.length < 4) return;
+            len = raw.readUInt16BE(2);
+            offset = 4;
+          } else if (len === 127) {
+            if (raw.length < 10) return;
+            if (raw.readUInt32BE(2) !== 0 || raw.readUInt32BE(6) > 1000000) {
+              socket.destroy();
+              done(new Error('ByteFM song history frame is too large.'));
+              return;
+            }
+            len = raw.readUInt32BE(6);
+            offset = 10;
+          }
+          if (len > 1000000) {
+            socket.destroy();
+            done(new Error('ByteFM song history frame is too large.'));
+            return;
+          }
+          if (raw.length < offset + len) return;
+          const body = raw.slice(offset, offset + len);
+          raw = raw.slice(offset + len);
+          if (opcode === 0x9) {
+            writeWsFrame(socket, 0xA, body);
+            continue;
+          }
+          if (opcode === 0x8) {
+            socket.destroy();
+            done(new Error('ByteFM song history closed.'));
+            return;
+          }
+          if (opcode === 0x1 || opcode === 0x0) {
+            text = Buffer.concat([text, body]);
+            if (!fin) continue;
+            socket.destroy();
+            try {
+              done(null, JSON.parse(text.toString('utf8')));
+            } catch (e) {
+              done(e);
+            }
+            return;
+          }
+        }
+      });
+      socket.on('error', function (err) { done(err); });
+      socket.on('end', function () { done(new Error('ByteFM song history closed.')); });
+    });
+    req.on('response', function (res) {
+      res.resume();
+      done(new Error('ByteFM song history failed: ' + res.statusCode));
+    });
+    req.on('error', function (err) { done(err); });
+    req.on('timeout', function () {
+      req.destroy();
+      done(new Error('ByteFM song history timed out.'));
+    });
+    req.end();
+  });
+}
+
+function downloadBytefmCover(url, dest, redirects) {
+  const hops = redirects || 0;
+  return new Promise(function (resolve, reject) {
+    let parsed;
+    try {
+      parsed = new URL(url);
+    } catch (e) {
+      reject(e);
+      return;
+    }
+    if (parsed.protocol !== 'https:') {
+      reject(new Error('ByteFM cover must be https.'));
+      return;
+    }
+    const req = https.get(parsed, {
+      headers: {
+        'User-Agent': BYTEFM_UA,
+        Accept: 'image/*,*/*;q=0.8',
+        Referer: 'https://www.byte.fm/'
+      },
+      timeout: 8000
+    }, function (res) {
+      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location && hops < 3) {
+        res.resume();
+        resolve(downloadBytefmCover(new URL(res.headers.location, parsed).href, dest, hops + 1));
+        return;
+      }
+      if (res.statusCode !== 200) {
+        res.resume();
+        reject(new Error('ByteFM cover failed: ' + res.statusCode));
+        return;
+      }
+      const chunks = [];
+      res.on('data', function (chunk) { chunks.push(chunk); });
+      res.on('end', function () {
+        const body = Buffer.concat(chunks);
+        if (!body.length) {
+          reject(new Error('ByteFM cover was empty.'));
+          return;
+        }
+        writeCoverAsJpeg(body, dest).then(resolve, reject);
+      });
+    });
+    req.on('error', reject);
+    req.on('timeout', function () {
+      req.destroy(new Error('ByteFM cover timed out.'));
+    });
+  });
+}
+
+function isBytefmCoverUrl(uri) {
+  try {
+    const url = new URL(uri);
+    const host = url.hostname.toLowerCase();
+    return url.protocol === 'https:' && (host === 'www.byte.fm' || host.endsWith('.byte.fm'));
+  } catch (e) {
+    return false;
+  }
+}
+
+function isFetchableCoverUrl(uri) {
+  if (isBytefmCoverUrl(uri)) return true;
+  try {
+    const url = new URL(uri);
+    const host = url.hostname.toLowerCase();
+    return url.protocol === 'https:' && (
+      host === 'lastfm.freetls.fastly.net' ||
+      host === 'lastfm-img.freetls.fastly.net' ||
+      host.endsWith('.last.fm')
+    );
+  } catch (e) {
+    return false;
+  }
+}
+
+function largestLastFmImage(images) {
+  if (!Array.isArray(images)) return '';
+  const order = ['extralarge', 'large', 'medium', 'small'];
+  for (let i = 0; i < order.length; i++) {
+    for (let j = 0; j < images.length; j++) {
+      if (images[j] && images[j].size === order[i] && images[j]['#text']) return images[j]['#text'];
+    }
+  }
+  return '';
+}
+
+function songFromPlayback(state) {
+  const title = String((state && state.title) || '').trim();
+  const artist = String((state && state.artist) || '').trim();
+  const split = splitBytefmTrack(title);
+  if (split.artist && split.title && !/byte\.?fm/i.test(split.artist)) return split;
+  if (artist && title && !/byte\.?fm/i.test(artist)) return { artist: artist, title: title };
+  return null;
+}
+
+// A status update that started before this write can put the file name back.
+// Later writes of the same song must not be overwritten by an older timer.
+let bytefmApplyGeneration = 0;
+
+// The live stream's own tags replace the title, and an archive file has no tags,
+// so Volumio would show the MP3 name. This writes ByteFM's artist, title, program,
+// and cover onto the current item and keeps them in place until the next song.
+// The player-state announcement is not awaited: waiting on it holds the HTTP
+// request open, and the extension then reports that Volumio did not respond.
+ControllerAlbumTools.prototype.applyBytefmNowPlaying = function (data) {
+  const self = this;
+  const sm = self.commandRouter.stateMachine;
+  if (!sm) return { ok: false, error: 'Player is not ready.' };
+  const position = sm.currentPosition;
+  const track = typeof sm.getTrack === 'function' ? sm.getTrack(position) : null;
+  const consumeUri = sm.consumeState && sm.consumeState.uri;
+  if (!track || (!isBytefmPlaybackUri(track.uri) && !isBytefmPlaybackUri(consumeUri))) {
+    return { ok: false, error: 'ByteFM is not the current item.' };
+  }
+
+  let title = data && data.title ? String(data.title).trim() : '';
+  const artist = data && data.artist ? String(data.artist).trim() : '';
+  const album = data && data.album ? String(data.album).trim() : '';
+  const suppliedArt = data && data.albumart ? String(data.albumart).trim() : '';
+  // The playback page loads a cover from Volumio. A ByteFM address is fetched
+  // here and published as a local albumart path, otherwise the image stays blank.
+  const albumart = self.albumartForPlayer(suppliedArt);
+  if (looksLikeFileName(title)) title = '';
+  if (!title && !artist && !album && !suppliedArt) return { ok: false, error: 'No track information.' };
+  if (!title && album) title = album;
+
+  if (title) {
+    track.name = title;
+    track.title = title;
+  }
+  if (artist) track.artist = artist;
+  if (album) track.album = album;
+  track.albumart = albumart;
+  sm.consumeIgnoreMetadata = true;
+  if (sm.consumeState) {
+    if (title) sm.consumeState.title = title;
+    if (artist) sm.consumeState.artist = artist;
+    if (album) sm.consumeState.album = album;
+    sm.consumeState.albumart = albumart;
+  }
+  try {
+    sm.pushState();
+  } catch (e) {
+    self.logger.error('[AlbumTools] Could not push ByteFM track information: ' + e);
+  }
+  if (isBytefmCoverUrl(suppliedArt)) {
+    self.cacheBytefmCover(suppliedArt, data);
+  } else if (suppliedArt.indexOf('bytefm-cover.jpg') === -1) {
+    self.bytefmCoverTicket = (self.bytefmCoverTicket || 0) + 1;
+  }
+  return { ok: true };
+};
+
+ControllerAlbumTools.prototype.albumartForPlayer = function (supplied) {
+  const value = String(supplied || '');
+  if (value.indexOf('sourceicon=user_interface/album_tools/') !== -1) return value;
+  if (value && value === this.bytefmCoverSource && this.bytefmCoverArt) return this.bytefmCoverArt;
+  return BYTEFM_LOGO;
+};
+
+ControllerAlbumTools.prototype.cacheBytefmCover = function (url, data, onReady) {
+  const self = this;
+  if (!isFetchableCoverUrl(url)) return;
+  if (url === self.bytefmCoverSource && self.bytefmCoverArt) {
+    if (typeof onReady === 'function') onReady(self.bytefmCoverArt);
+    return;
+  }
+  if (self.bytefmCoverFetching === url) return;
+  const ticket = (self.bytefmCoverTicket || 0) + 1;
+  self.bytefmCoverTicket = ticket;
+  self.bytefmCoverFetching = url;
+  const dest = path.join(__dirname, BYTEFM_COVER_FILE);
+  downloadBytefmCover(url, dest).then(function () {
+    if (self.bytefmCoverTicket !== ticket) return;
+    self.bytefmCoverSource = url;
+    self.bytefmCoverArt = localBytefmCover(url);
+    self.bytefmCoverFetching = '';
+    if (self.bytefmPendingKey && self.bytefmPendingKey.slice(-url.length) === url) {
+      self.bytefmLiveKey = self.bytefmPendingKey;
+    }
+    if (typeof onReady === 'function') {
+      onReady(self.bytefmCoverArt);
+      return;
+    }
+    self.applyBytefmNowPlaying({
+      title: data && data.title,
+      artist: data && data.artist,
+      album: data && data.album,
+      albumart: self.bytefmCoverArt
+    });
+  }).catch(function (err) {
+    if (self.bytefmCoverFetching === url) self.bytefmCoverFetching = '';
+    self.logger.warn('[AlbumTools] ByteFM cover: ' + (err && err.message ? err.message : err));
+    if (typeof onReady === 'function') onReady('');
+  });
+};
+
+ControllerAlbumTools.prototype.pollBytefmLive = function () {
+  const self = this;
+  if (self.bytefmLiveBusy) return;
+  const sm = self.commandRouter.stateMachine;
+  if (!sm || sm.currentStatus !== 'play') return;
+  const position = sm.currentPosition;
+  const track = typeof sm.getTrack === 'function' ? sm.getTrack(position) : null;
+  const consumeUri = sm.consumeState && sm.consumeState.uri;
+  if (!isBytefmLiveUri(track && track.uri) && !isBytefmLiveUri(consumeUri)) return;
+
+  self.bytefmLiveBusy = true;
+  readBytefmSongHistory().then(function (data) {
+    const smNow = self.commandRouter.stateMachine;
+    const nowTrack = smNow && typeof smNow.getTrack === 'function' ? smNow.getTrack(smNow.currentPosition) : null;
+    const nowConsume = smNow && smNow.consumeState && smNow.consumeState.uri;
+    if (!smNow || smNow.currentStatus !== 'play') return;
+    if (!isBytefmLiveUri(nowTrack && nowTrack.uri) && !isBytefmLiveUri(nowConsume)) return;
+
+    const tracks = bytefmChannel(data.tracks);
+    const song = splitBytefmTrack(Array.isArray(tracks) ? tracks[0] : '');
+    const show = decodeHtml(bytefmChannel(data.current_show_title));
+    const subtitle = decodeHtml(bytefmChannel(data.current_show_subtitle));
+    const album = show && subtitle ? show + ' – ' + subtitle : show || subtitle || 'ByteFM';
+    const info = {
+      title: song.title || 'ByteFM',
+      artist: song.artist,
+      album: album,
+      albumart: bytefmCover(bytefmChannel(data.artistImageURL)) || bytefmCover(bytefmChannel(data.moderator_image))
+    };
+    const key = [info.artist, info.title, info.album, info.albumart].join('\n');
+    if (key === self.bytefmLiveKey) return;
+    self.bytefmPendingKey = key;
+    const applied = self.applyBytefmNowPlaying(info);
+    if (!applied || !applied.ok) return;
+    if (!info.albumart || self.bytefmCoverSource === info.albumart) self.bytefmLiveKey = key;
+  }).catch(function (err) {
+    if (!self.bytefmHistoryWarned) {
+      self.bytefmHistoryWarned = true;
+      self.logger.warn('[AlbumTools] ByteFM song history is blocked (' + (err && err.message ? err.message : err) + '). Using the stream title for the cover.');
+    }
+    return self.coverFromStreamTitle();
+  }).then(function () {
+    self.bytefmLiveBusy = false;
+  });
+};
+
+ControllerAlbumTools.prototype.applyBytefmLiveArt = function (albumart) {
+  const sm = this.commandRouter.stateMachine;
+  if (!sm || !albumart) return;
+  const track = typeof sm.getTrack === 'function' ? sm.getTrack(sm.currentPosition) : null;
+  const consumeUri = sm.consumeState && sm.consumeState.uri;
+  if (!isBytefmLiveUri(track && track.uri) && !isBytefmLiveUri(consumeUri)) return;
+  if (track) track.albumart = albumart;
+  sm.consumeIgnoreMetadata = false;
+  if (sm.consumeState) sm.consumeState.albumart = albumart;
+  try {
+    sm.pushState();
+  } catch (e) {
+    this.logger.error('[AlbumTools] Could not push ByteFM cover: ' + e);
+  }
+};
+
+ControllerAlbumTools.prototype.lookupLastFmTrack = function (artist, track) {
+  const self = this;
+  const configured = self.getConfigValue('lastfmApiKey', '');
+  const apiKey = configured || '4cb074e4b8ec4ee9ad3eb37d6f7eb240';
+  const query = '/2.0/?method=track.getInfo&artist=' + encodeURIComponent(artist) +
+    '&track=' + encodeURIComponent(track) +
+    '&api_key=' + encodeURIComponent(apiKey) + '&format=json';
+  return new Promise(function (resolve, reject) {
+    http.get({ host: 'ws.audioscrobbler.com', port: 80, path: query }, function (res) {
+      let body = '';
+      res.on('data', function (chunk) { body += chunk; });
+      res.on('end', function () {
+        try {
+          const json = JSON.parse(body);
+          if (json.error) {
+            reject(new Error(json.message || 'Last.fm error'));
+            return;
+          }
+          const album = json.track && json.track.album;
+          resolve({
+            artist: artist,
+            title: track,
+            album: album && album.title ? album.title : '',
+            albumart: largestLastFmImage(album && album.image)
+          });
+        } catch (e) {
+          reject(e);
+        }
+      });
+    }).on('error', reject);
+  });
+};
+
+ControllerAlbumTools.prototype.coverFromStreamTitle = function () {
+  const self = this;
+  const sm = self.commandRouter.stateMachine;
+  if (!sm || sm.currentStatus !== 'play') return Promise.resolve();
+  const track = typeof sm.getTrack === 'function' ? sm.getTrack(sm.currentPosition) : null;
+  const consumeUri = sm.consumeState && sm.consumeState.uri;
+  if (!isBytefmLiveUri(track && track.uri) && !isBytefmLiveUri(consumeUri)) return Promise.resolve();
+  if (sm.consumeIgnoreMetadata) sm.consumeIgnoreMetadata = false;
+
+  const song = songFromPlayback(sm.consumeState);
+  if (!song) return Promise.resolve();
+  const key = song.artist + '\n' + song.title;
+  if (key === self.bytefmLiveKey || key === self.bytefmLivePending) return Promise.resolve();
+  self.bytefmLivePending = key;
+
+  return self.lookupLastFmTrack(song.artist, song.title).then(function (info) {
+    if (!info.albumart) {
+      self.bytefmLivePending = '';
+      self.bytefmLiveKey = key;
+      self.applyBytefmLiveArt(BYTEFM_LOGO);
+      self.logger.info('[AlbumTools] No cover for ' + song.artist + ' – ' + song.title + ', using the ByteFM image.');
+      return;
+    }
+    self.cacheBytefmCover(info.albumart, info, function (albumart) {
+      if (!albumart) {
+        self.bytefmLivePending = '';
+        const nowSong = songFromPlayback(self.commandRouter.stateMachine && self.commandRouter.stateMachine.consumeState);
+        if (nowSong && (nowSong.artist + '\n' + nowSong.title) === key) {
+          self.bytefmLiveKey = key;
+          self.applyBytefmLiveArt(BYTEFM_LOGO);
+        }
+        return;
+      }
+      const nowSong = songFromPlayback(self.commandRouter.stateMachine && self.commandRouter.stateMachine.consumeState);
+      if (!nowSong || (nowSong.artist + '\n' + nowSong.title) !== key) {
+        self.bytefmLivePending = '';
+        return;
+      }
+      self.applyBytefmLiveArt(albumart);
+      self.bytefmLiveKey = key;
+      self.bytefmLivePending = '';
+    });
+  }).catch(function (err) {
+    self.bytefmLivePending = '';
+    self.logger.warn('[AlbumTools] ByteFM cover lookup: ' + (err && err.message ? err.message : err));
+  });
+};
+
+ControllerAlbumTools.prototype.setBytefmNowPlaying = function (data) {
+  const self = this;
+  const generation = ++bytefmApplyGeneration;
+  const applied = self.applyBytefmNowPlaying(data);
+  if (!applied.ok) return Promise.reject(applied.error);
+  [400, 1200].forEach(function (delay) {
+    setTimeout(function () {
+      if (generation !== bytefmApplyGeneration) return;
+      self.applyBytefmNowPlaying(data);
+    }, delay);
+  });
+  return { success: true };
+};
+
 ControllerAlbumTools.prototype.onStop = function () {
+  if (this.bytefmLiveTimer) {
+    clearInterval(this.bytefmLiveTimer);
+    this.bytefmLiveTimer = null;
+  }
   this.commandRouter.removePluginRestEndpoint({ endpoint: 'similar_albums' });
   this.commandRouter.removePluginRestEndpoint({ endpoint: 'recently_added_albums' });
+  this.commandRouter.removePluginRestEndpoint({ endpoint: 'bytefm_now_playing' });
   return resolve();
 };
 

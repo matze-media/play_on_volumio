@@ -27,37 +27,75 @@ function formatTime(sec) {
   return `${m}:${s.toString().padStart(2, "0")}`;
 }
 
+function extensionAlive() {
+  try {
+    return Boolean(chrome.runtime && chrome.runtime.id);
+  } catch {
+    return false;
+  }
+}
+
+function runtimeSend(message, callback) {
+  if (!extensionAlive()) return;
+  try {
+    chrome.runtime.sendMessage(message, (response) => {
+      try {
+        if (chrome.runtime.lastError) {
+          if (callback) callback(undefined);
+          return;
+        }
+      } catch {
+        return;
+      }
+      if (callback) callback(response);
+    });
+  } catch {
+    // The extension was reloaded. This page still has the previous content script.
+  }
+}
+
 // -----------------------------------------------------------------------------
 // Media Session API (macOS Control Center, media keys)
 // Requires a playing audio element to activate
 // -----------------------------------------------------------------------------
 let mediaSessionAudio = null;
 let mediaSessionReady = false;
+let mediaSessionPlayToken = 0;
+let mediaSessionGesture = false;
 
-/** When the page becomes hidden (lid close, sleep), Chrome pauses the silent audio and may invoke
- *  the Media Session pause handler—forwarding that to Volumio wrongly stops playback on the device.
- *  Skip forwarding pause to Volumio for a short interval right after hide (system suspend).
+/** Closing the laptop makes macOS pause Now Playing. That pause can arrive while the
+ *  page is still visible, or several seconds after it is hidden. Hold it briefly and
+ *  send it to Volumio only if the page is still on screen.
  */
-let visibilityHiddenAt = 0;
-const PAUSE_FORWARD_SUPPRESS_MS = 2500;
+let mediaPauseTimer = null;
+
+function cancelPendingMediaPause() {
+  if (!mediaPauseTimer) return;
+  clearTimeout(mediaPauseTimer);
+  mediaPauseTimer = null;
+}
+
+function noteMediaSessionGesture() {
+  mediaSessionGesture = true;
+  if (mediaSessionReady || currentTrack?.status !== "play") return;
+  syncMediaSessionAudio("play");
+}
+
+document.addEventListener("pointerdown", noteMediaSessionGesture, true);
+document.addEventListener("keydown", noteMediaSessionGesture, true);
 
 document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "hidden") {
-    visibilityHiddenAt = Date.now();
-  } else {
-    visibilityHiddenAt = 0;
-    if (currentTrack) {
-      setupMediaSession();
-      updateMediaSessionMetadata(currentTrack);
-    }
+    cancelPendingMediaPause();
+    return;
+  }
+  if (currentTrack) {
+    setupMediaSession();
+    updateMediaSessionMetadata(currentTrack);
   }
 });
-
-function shouldForwardMediaPauseToVolumio() {
-  if (document.visibilityState === "visible") return true;
-  if (!visibilityHiddenAt) return true;
-  return Date.now() - visibilityHiddenAt > PAUSE_FORWARD_SUPPRESS_MS;
-}
+document.addEventListener("freeze", cancelPendingMediaPause);
+document.addEventListener("pagehide", cancelPendingMediaPause);
 
 function setupMediaSession() {
   if (mediaSessionAudio) return;
@@ -69,24 +107,16 @@ function setupMediaSession() {
   document.body.appendChild(audio);
   mediaSessionAudio = audio;
 
-  audio.play().then(
-    () => {
-      mediaSessionReady = true;
-    },
-    (err) => {
-      console.warn("[Play on Volumio] Media Session autoplay blocked:", err.message);
-    }
-  );
-
   if ("mediaSession" in navigator) {
     navigator.mediaSession.setActionHandler("play", () => {
-      mediaSessionAudio?.play();
+      mediaSessionGesture = true;
+      syncMediaSessionAudio("play");
       navigator.mediaSession.playbackState = "playing";
       if (currentTrack) currentTrack.status = "play";
       syncOverlayPlayPauseButton("play");
-      chrome.runtime.sendMessage({ action: "play" }, (r) => {
+      runtimeSend({ action: "play" }, (r) => {
         if (!r?.success) {
-          mediaSessionAudio?.pause();
+          syncMediaSessionAudio("pause");
           navigator.mediaSession.playbackState = "paused";
           if (currentTrack) currentTrack.status = "pause";
           syncOverlayPlayPauseButton("pause");
@@ -95,32 +125,36 @@ function setupMediaSession() {
       });
     });
     navigator.mediaSession.setActionHandler("pause", () => {
-      mediaSessionAudio?.pause();
-      navigator.mediaSession.playbackState = "paused";
-      if (currentTrack) currentTrack.status = "pause";
-      syncOverlayPlayPauseButton("pause");
-      if (!shouldForwardMediaPauseToVolumio()) {
-        return;
-      }
-      chrome.runtime.sendMessage({ action: "pause" }, (r) => {
-        if (!r?.success) {
-          mediaSessionAudio?.play();
-          navigator.mediaSession.playbackState = "playing";
-          if (currentTrack) currentTrack.status = "play";
-          syncOverlayPlayPauseButton("play");
-          console.info("Pause failed:", r?.error);
-        }
-      });
+      if (document.visibilityState !== "visible") return;
+      cancelPendingMediaPause();
+      mediaPauseTimer = setTimeout(() => {
+        mediaPauseTimer = null;
+        if (document.visibilityState !== "visible") return;
+        syncMediaSessionAudio("pause");
+        navigator.mediaSession.playbackState = "paused";
+        if (currentTrack) currentTrack.status = "pause";
+        syncOverlayPlayPauseButton("pause");
+        runtimeSend({ action: "pause" }, (r) => {
+          if (!r?.success) {
+            mediaSessionGesture = true;
+            syncMediaSessionAudio("play");
+            navigator.mediaSession.playbackState = "playing";
+            if (currentTrack) currentTrack.status = "play";
+            syncOverlayPlayPauseButton("play");
+            console.info("Pause failed:", r?.error);
+          }
+        });
+      }, 1000);
     });
     navigator.mediaSession.setActionHandler("previoustrack", () => {
-      chrome.runtime.sendMessage({ action: "prev" }, (r) => !r?.success && console.info("Prev failed:", r?.error));
+      runtimeSend({ action: "prev" }, (r) => !r?.success && console.info("Prev failed:", r?.error));
     });
     navigator.mediaSession.setActionHandler("nexttrack", () => {
-      chrome.runtime.sendMessage({ action: "next" }, (r) => !r?.success && console.info("Next failed:", r?.error));
+      runtimeSend({ action: "next" }, (r) => !r?.success && console.info("Next failed:", r?.error));
     });
     navigator.mediaSession.setActionHandler("seekto", (details) => {
       if (details.seekTime != null) {
-        chrome.runtime.sendMessage({ action: "seek", value: Math.floor(details.seekTime) });
+        runtimeSend({ action: "seek", value: Math.floor(details.seekTime) });
       }
     });
   }
@@ -134,16 +168,31 @@ function syncOverlayPlayPauseButton(status) {
   }
 }
 
+function syncMediaSessionAudio(status) {
+  const audio = mediaSessionAudio;
+  if (!audio) return;
+  const token = ++mediaSessionPlayToken;
+  if (status === "play") {
+    if (!mediaSessionGesture) return;
+    audio.play().then(
+      () => {
+        if (token !== mediaSessionPlayToken) return;
+        mediaSessionReady = true;
+      },
+      (err) => {
+        if (token !== mediaSessionPlayToken) return;
+        if (err && (err.name === "AbortError" || err.name === "NotAllowedError")) return;
+      }
+    );
+    return;
+  }
+  audio.pause();
+}
+
 function updateMediaSessionMetadata(track) {
   if (!("mediaSession" in navigator)) return;
 
-  if (mediaSessionAudio) {
-    if (track.status === "play") {
-      mediaSessionAudio.play().catch(() => {});
-    } else {
-      mediaSessionAudio.pause();
-    }
-  }
+  syncMediaSessionAudio(track.status);
 
   function setMetadata(artwork) {
     navigator.mediaSession.metadata = new MediaMetadata({
@@ -168,8 +217,8 @@ function updateMediaSessionMetadata(track) {
         ];
         setMetadata(artwork);
       } else {
-        chrome.runtime.sendMessage({ action: "getAlbumArt", url: track.albumart }, (dataUrl) => {
-          if (dataUrl && !chrome.runtime.lastError) {
+        runtimeSend({ action: "getAlbumArt", url: track.albumart }, (dataUrl) => {
+          if (dataUrl) {
             const mime = dataUrl.match(/^data:([^;]+)/)?.[1] || "image/jpeg";
             const artwork = [
               { src: dataUrl, sizes: "96x96", type: mime },
@@ -181,8 +230,8 @@ function updateMediaSessionMetadata(track) {
         });
       }
     } catch {
-      chrome.runtime.sendMessage({ action: "getAlbumArt", url: track.albumart }, (dataUrl) => {
-        if (dataUrl && !chrome.runtime.lastError) {
+      runtimeSend({ action: "getAlbumArt", url: track.albumart }, (dataUrl) => {
+        if (dataUrl) {
           const mime = dataUrl.match(/^data:([^;]+)/)?.[1] || "image/jpeg";
           const artwork = [
             { src: dataUrl, sizes: "96x96", type: mime },
@@ -373,12 +422,12 @@ function updateOverlay(track) {
 
   // Previous
   document.getElementById("volumio-previous").addEventListener("click", () => {
-    chrome.runtime.sendMessage({ action: "prev" }, (r) => !r?.success && console.info("Prev failed:", r?.error));
+    runtimeSend({ action: "prev" }, (r) => !r?.success && console.info("Prev failed:", r?.error));
   });
 
   // Next
   document.getElementById("volumio-next").addEventListener("click", () => {
-    chrome.runtime.sendMessage({ action: "next" }, (r) => !r?.success && console.info("Next failed:", r?.error));
+    runtimeSend({ action: "next" }, (r) => !r?.success && console.info("Next failed:", r?.error));
   });
 
   // Play / Pause (keep Material Icons)
@@ -386,7 +435,7 @@ function updateOverlay(track) {
   playPauseBtn.addEventListener("click", () => {
     if (!currentTrack) return;
     const action = currentTrack.status === "play" ? "pause" : "play";
-    chrome.runtime.sendMessage({ action }, (res) => {
+    runtimeSend({ action }, (res) => {
       if (res?.success) {
         currentTrack.status = currentTrack.status === "play" ? "pause" : "play";
         const icon = currentTrack.status === "play" ? "pause" : "play_arrow";
@@ -406,7 +455,7 @@ function updateOverlay(track) {
 
     progressEl.addEventListener("input", (e) => {
       const newSeek = parseInt(e.target.value, 10);
-      chrome.runtime.sendMessage({ action: "seek", value: newSeek });
+      runtimeSend({ action: "seek", value: newSeek });
     });
 
     if (track.status === "play" && duration > 0) {
@@ -433,7 +482,7 @@ function updateOverlay(track) {
     const pct = Math.max(0, Math.min(1, 1 - y / rect.height));
     volThumb.style.bottom = `${pct * 100}%`;
     volFill.style.height = `${pct * 100}%`;
-    chrome.runtime.sendMessage({ action: "setVolume", value: Math.round(pct * 100) });
+    runtimeSend({ action: "setVolume", value: Math.round(pct * 100) });
   }
 
   volWrap?.addEventListener("click", (e) => {
@@ -456,11 +505,18 @@ function updateOverlay(track) {
 // Init: Overlay (albumoftheyear) or Media Session only (Volumio tab)
 // -----------------------------------------------------------------------------
 (async () => {
-  const { volumioIp, volumioApiPort, volumioWebPort } = await chrome.storage.sync.get([
-    "volumioIp",
-    "volumioApiPort",
-    "volumioWebPort"
-  ]);
+  let volumioIp;
+  let volumioApiPort;
+  let volumioWebPort;
+  try {
+    ({ volumioIp, volumioApiPort, volumioWebPort } = await chrome.storage.sync.get([
+      "volumioIp",
+      "volumioApiPort",
+      "volumioWebPort"
+    ]));
+  } catch {
+    return;
+  }
   const webPort = parseInt(volumioWebPort ?? volumioApiPort ?? DEFAULT_API_PORT, 10);
   const expectedHost = webPort === HTTP_DEFAULT_PORT ? volumioIp : `${volumioIp}:${webPort}`;
   const isVolumioPage = volumioIp && window.location.host === expectedHost;
@@ -483,18 +539,19 @@ function updateOverlay(track) {
     `;
     overlay.innerText = "Waiting for Volumio…";
     overlay.addEventListener("click", () => {
-      if (!mediaSessionReady && mediaSessionAudio) {
-        mediaSessionAudio.play().then(
-          () => { mediaSessionReady = true; },
-          () => {}
-        );
-      }
+      noteMediaSessionGesture();
     });
     document.body.appendChild(overlay);
   }
 
   setupMediaSession();
-  const port = chrome.runtime.connect({ name: "volumioOverlay" });
+  if (!extensionAlive()) return;
+  let port;
+  try {
+    port = chrome.runtime.connect({ name: "volumioOverlay" });
+  } catch {
+    return;
+  }
   port.onMessage.addListener((msg) => {
     if (msg.action === "nowPlaying") {
       updateOverlay(msg.data);

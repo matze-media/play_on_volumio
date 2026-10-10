@@ -8,7 +8,7 @@
     "128": "icons/icon128.png"
   },
   "description": "Adds a ‘Play on Volumio’ button to albumoftheyear.org.",
-  "permissions": ["storage", "scripting","tabs"],
+  "permissions": ["storage", "scripting", "tabs"],
   "host_permissions": ["http://*/*", "https://*/*"],
   "background": {
     "service_worker": "background.js"
@@ -47,6 +47,17 @@
     {
       "matches": ["*://www.albumoftheyear.org/*"],
       "js": ["content_overlay.js"]
-      }
+    },
+    {
+      "matches": ["https://www.byte.fm/*"],
+      "js": ["content_bytefm.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["bytefm_page_bridge.js"],
+      "matches": ["https://www.byte.fm/*"]
+    }
   ]
 }
