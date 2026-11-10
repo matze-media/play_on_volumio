@@ -12,13 +12,14 @@ A Chrome extension that adds **"Play on Volumio"** buttons to [albumoftheyear.or
 - **Similar albums** – On the Volumio browse/playback pages, a "Search similar album" button finds albums similar to the currently playing track (requires Album Tools plugin)
 - **Recently added** – A "Recently added" button shows albums from your MPD library ordered by add date (requires Album Tools plugin)
 - **Popularity bars** – On the Volumio queue (`/queue`) and on an album track list (`/browse`), each song gets a Last.fm listener bar. The bar length is that song's score within the album. The number inside the bar is the listener count (requires Album Tools 1.3.1)
+- **Playback info** – On the Volumio playback page, an info icon left of the heart opens the Last.fm artist biography, album wiki, and track wiki (requires Album Tools 1.3.2)
 
 ## Requirements
 
 - **Chrome** (or Chromium-based browser)
 - **Volumio** running on your local network
 - **albumoftheyear.org** – Extension only works on this site
-- **Album Tools Volumio plugin** – Required for Similar Albums, Recently Added, and popularity bars (included in this repo). Popularity bars need plugin **1.3.1** or newer.
+- **Album Tools Volumio plugin** – Required for Similar Albums, Recently Added, popularity bars, and playback info (included in this repo). Popularity bars need plugin **1.3.1** or newer. Playback info needs plugin **1.3.2** or newer.
 
 ## Installation
 
@@ -100,6 +101,7 @@ Full details, update instructions, and API reference: [volumio_plugins/user_inte
 - **Similar albums** – Open the Volumio Web UI, go to **Browse** (`/browse`) or **Playback** (`/playback`), play a track, then click **Search similar album**. A modal lists similar albums from your library; click a cover to play.
 - **Recently added** – On the same Volumio pages, click **Recently added** to see albums from your library ordered by add date; click a cover to play.
 - **Popularity bars** – Open **Queue** (`/queue`) or an album on **Browse** (`/browse`). Each track shows a green bar just before the duration. Hover the bar for the Last.fm play count. In the plugin settings, **Show Last.fm popularity bars** turns the feature off, and **Minimum album listeners** skips albums below that listener count (default 50). A song Last.fm does not know keeps an empty slot so the other columns stay aligned.
+- **Playback info** – Open **Playback** (`/playback`) and click the info icon immediately left of the heart. The panel loads only after that click. It has three chapters, **Artist**, **Album**, and **Track**, and the text scrolls inside the panel.
 
 ## Supported Pages
 

@@ -1,6 +1,6 @@
 {
   "name": "album_tools",
-  "version": "1.3.1",
+  "version": "1.3.2",
   "description": "Album Tools: Similar Albums, Recently Added Albums, and queue popularity bars. Uses Last.fm API and MPD library.",
   "main": "index.js",
   "scripts": {
@@ -15,7 +15,7 @@
     "architectures": ["amd64", "armhf", "arm"],
     "os": ["buster", "bullseye", "bookworm"],
     "details": "Similar Albums (Last.fm), Recently Added Albums (MPD), and Last.fm popularity bars for the play queue.",
-    "changelog": "1.3.1 Score the track titles reported by the library, so a song still gets a bar when Last.fm's album listing uses a different name. 1.3.0 Add Last.fm popularity bars for the play queue. A setting turns them on, and albums below a listener minimum are left unscored."
+    "changelog": "1.3.2 Add playback_info for the artist biography, album wiki, and track wiki shown from the playback page. 1.3.1 Score the track titles reported by the library, so a song still gets a bar when Last.fm's album listing uses a different name. 1.3.0 Add Last.fm popularity bars for the play queue. A setting turns them on, and albums below a listener minimum are left unscored."
   },
   "engines": {
     "node": ">=14",

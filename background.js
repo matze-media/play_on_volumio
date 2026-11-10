@@ -264,7 +264,7 @@ function isVolumioTabUrl(url) {
 function injectOverlayIntoVolumioTab(tabId) {
   if (!volumioIp) return;
   chrome.scripting
-    .executeScript({ target: { tabId }, files: ["content_overlay.js", "content_volumio.js", "content_queue_score.js"] })
+    .executeScript({ target: { tabId }, files: ["content_overlay.js", "content_volumio.js", "content_queue_score.js", "content_playback_info.js"] })
     .then(() => console.log("[Play on Volumio] Injected into tab", tabId))
     .catch((err) => console.warn("[Play on Volumio] Injection failed:", err));
 }
@@ -480,6 +480,35 @@ async function getBrowsePopularity(baseUrl, groups) {
   return { success: true, data: { groups: scored } };
 }
 
+async function getPlaybackInfo(baseUrl) {
+  const stateRes = await fetch(`${baseUrl}/api/v1/getState`);
+  if (!stateRes.ok) throw new Error(`State failed: ${stateRes.status}`);
+  const state = await stateRes.json();
+  const artist = state && state.artist ? String(state.artist).trim() : "";
+  const album = state && state.album ? String(state.album).trim() : "";
+  const title = state && state.title ? String(state.title).trim() : "";
+  const res = await fetch(`${baseUrl}/api/v1/pluginEndpoint`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      endpoint: "playback_info",
+      data: { artist, album, title }
+    }),
+    signal: AbortSignal.timeout(20000)
+  });
+  let json = null;
+  try {
+    json = await res.json();
+  } catch {
+    json = null;
+  }
+  if (!res.ok || !json || json.success === false) {
+    const error = (json && (json.error || json.message)) || `Playback info failed: ${res.status}`;
+    throw new Error(error);
+  }
+  return json;
+}
+
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   // --- getAlbumArt: Proxy image fetch to avoid Referrer Policy / mixed content ---
   if (msg.action === "getAlbumArt") {
@@ -619,6 +648,11 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 
       if (msg.action === "getBrowsePopularity") {
         sendResponse(await getBrowsePopularity(baseUrl, msg.groups));
+        return;
+      }
+
+      if (msg.action === "getPlaybackInfo") {
+        sendResponse(await getPlaybackInfo(baseUrl));
         return;
       }
 

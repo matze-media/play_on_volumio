@@ -1,18 +1,19 @@
 # Album Tools
 
-Volumio plugin combining **Similar Albums** and **Recently Added Albums** in one place.
+Volumio plugin for **Similar Albums**, **Recently Added Albums**, album popularity scores, and the playback-page Last.fm text.
 
 ## Features
 
 - **Similar Albums** – Uses Last.fm API to find similar artists/tracks, returns only albums in your MPD library
 - **Recently Added Albums** – Returns albums from MPD library ordered by add date (MPD 0.24+)
 - **Album popularity** – Scores the tracks of one album from Last.fm play counts. The Chrome extension draws those scores on `/queue` and on an album's track list at `/browse`.
+- **Playback info** – Returns the Last.fm artist biography, album wiki, and track wiki for the track that is playing. The extension asks for this only when the info icon on `/playback` is clicked.
 
 ## Requirements
 
 - Volumio 3 with MPD music library
 - SSH access to your Volumio device
-- [Last.fm API key](https://www.last.fm/api/account/create) (free) – for Similar Albums and album popularity. The shared secret is not used.
+- [Last.fm API key](https://www.last.fm/api/account/create) (free) – for Similar Albums, album popularity, and playback info. The shared secret is not used.
 
 ## Installation
 
@@ -198,6 +199,22 @@ curl -X POST "http://localhost:3000/api/v1/pluginEndpoint" \
 ```
 
 **Response:** `{ success, data: { enabled, artist, album, albumListeners, tracks: [{ title, playcount, listeners, score }] } }`
+
+### Playback info
+
+```
+POST /api/v1/pluginEndpoint
+```
+
+```json
+{ "endpoint": "playback_info", "data": { "artist": "ANOHNI", "album": "HOPELESSNESS", "title": "4 Degrees" } }
+```
+
+Returns plain text for the playing track. Last.fm is called only when this endpoint is requested. The artist chapter uses the long biography when Last.fm has one, and the short biography otherwise. The album chapter uses the long wiki text, then the wiki summary. The track chapter uses the short wiki summary. HTML from Last.fm is removed before the text is returned. A chapter with nothing to say has an empty `text`.
+
+The album lookup is skipped when `album` is empty. The track lookup is skipped when `title` is empty. A missing Last.fm API key rejects with `"Last.fm API key not configured"`.
+
+**Response:** `{ success, data: { artist: { name, text }, album: { name, text }, track: { name, text } } }`
 
 ## License
 

@@ -89,6 +89,13 @@ ControllerAlbumTools.prototype.onStart = function () {
     method: 'getAlbumPopularity'
   });
 
+  this.commandRouter.addPluginRestEndpoint({
+    endpoint: 'playback_info',
+    type: 'user_interface',
+    name: 'album_tools',
+    method: 'getPlaybackInfo'
+  });
+
   this.logger.info('[AlbumTools] Plugin started, REST endpoints registered');
   self.bytefmLiveKey = '';
   self.bytefmLiveTimer = setInterval(function () {
@@ -760,6 +767,7 @@ ControllerAlbumTools.prototype.onStop = function () {
   this.commandRouter.removePluginRestEndpoint({ endpoint: 'recently_added_albums' });
   this.commandRouter.removePluginRestEndpoint({ endpoint: 'bytefm_now_playing' });
   this.commandRouter.removePluginRestEndpoint({ endpoint: 'album_popularity' });
+  this.commandRouter.removePluginRestEndpoint({ endpoint: 'playback_info' });
   return resolve();
 };
 
@@ -1658,5 +1666,146 @@ ControllerAlbumTools.prototype.getAlbumPopularity = function (data) {
         tracks: tracks
       };
     });
+  });
+};
+
+function stripLastFmHtml(value) {
+  let text = String(value || '');
+  text = text.replace(/<\s*br\s*\/?\s*>/gi, '\n');
+  text = text.replace(/<\s*\/\s*p\s*>/gi, '\n\n');
+  text = text.replace(/<[^>]+>/g, '');
+  text = text
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&amp;/gi, '&')
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/&quot;/gi, '"')
+    .replace(/&#0*39;|&apos;/gi, "'")
+    .replace(/&#(\d+);/g, function (_, codePoint) {
+      const code = parseInt(codePoint, 10);
+      return code > 0 && code < 0x110000 ? String.fromCodePoint(code) : '';
+    });
+  return text.replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+}
+
+function firstLastFmText(primary, fallback) {
+  const longText = stripLastFmHtml(primary);
+  if (longText) return longText;
+  return stripLastFmHtml(fallback);
+}
+
+function emptyPlaybackChapter(name) {
+  return { name: name || '', text: '' };
+}
+
+ControllerAlbumTools.prototype.fetchLastFmArtistText = function (artist, apiKey) {
+  const self = this;
+  const key = 'artist-text\n' + artist.toLowerCase();
+  const cached = self.readLastFmCache(key);
+  if (cached) return Promise.resolve(cached.value);
+
+  const query = '/2.0/?method=artist.getInfo&artist=' + encodeURIComponent(artist) +
+    '&autocorrect=1&api_key=' + encodeURIComponent(apiKey) + '&format=json';
+
+  return self.lastFmGet(query).then(function (json) {
+    const info = json && json.artist;
+    const bio = info && info.bio;
+    const value = {
+      name: (info && info.name) || artist,
+      text: firstLastFmText(bio && bio.content, bio && bio.summary)
+    };
+    self.writeLastFmCache(key, value);
+    return value;
+  }).catch(function (err) {
+    self.logger.info('[AlbumTools] artist.getInfo failed for "' + artist + '": ' + (err && err.message ? err.message : err));
+    return emptyPlaybackChapter(artist);
+  });
+};
+
+ControllerAlbumTools.prototype.fetchLastFmAlbumText = function (artist, album, apiKey) {
+  const self = this;
+  const key = 'album-text\n' + artist.toLowerCase() + '\n' + album.toLowerCase();
+  const cached = self.readLastFmCache(key);
+  if (cached) return Promise.resolve(cached.value);
+
+  const query = '/2.0/?method=album.getInfo&artist=' + encodeURIComponent(artist) +
+    '&album=' + encodeURIComponent(album) +
+    '&autocorrect=1&api_key=' + encodeURIComponent(apiKey) + '&format=json';
+
+  return self.lastFmGet(query).then(function (json) {
+    const info = json && json.album;
+    const wiki = info && info.wiki;
+    const value = {
+      name: (info && info.name) || album,
+      text: firstLastFmText(wiki && wiki.content, wiki && wiki.summary)
+    };
+    self.writeLastFmCache(key, value);
+    return value;
+  }).catch(function (err) {
+    self.logger.info('[AlbumTools] album.getInfo text failed for "' + artist + '" / "' + album + '": ' + (err && err.message ? err.message : err));
+    return emptyPlaybackChapter(album);
+  });
+};
+
+ControllerAlbumTools.prototype.fetchLastFmTrackText = function (artist, title, apiKey) {
+  const self = this;
+  const key = 'track-text\n' + artist.toLowerCase() + '\n' + title.toLowerCase();
+  const cached = self.readLastFmCache(key);
+  if (cached) return Promise.resolve(cached.value);
+
+  const query = '/2.0/?method=track.getInfo&artist=' + encodeURIComponent(artist) +
+    '&track=' + encodeURIComponent(title) +
+    '&autocorrect=1&api_key=' + encodeURIComponent(apiKey) + '&format=json';
+
+  return self.lastFmGet(query).then(function (json) {
+    const info = json && json.track;
+    const wiki = info && info.wiki;
+    const value = {
+      name: (info && info.name) || title,
+      text: stripLastFmHtml(wiki && wiki.summary)
+    };
+    self.writeLastFmCache(key, value);
+    return value;
+  }).catch(function (err) {
+    self.logger.info('[AlbumTools] track.getInfo text failed for "' + artist + '" / "' + title + '": ' + (err && err.message ? err.message : err));
+    return emptyPlaybackChapter(title);
+  });
+};
+
+ControllerAlbumTools.prototype.getPlaybackInfo = function (data) {
+  const self = this;
+  self.configFile = self.getConfigPath();
+  if (!self.config) self.config = new vConf();
+  try {
+    self.config.loadFile(self.configFile);
+  } catch (e) {
+    self.logger.info('[AlbumTools] loadFile error: ' + e.message);
+  }
+
+  const payload = data || {};
+  const artist = payload.artist ? String(payload.artist).trim() : '';
+  const album = payload.album ? String(payload.album).trim() : '';
+  const title = payload.title ? String(payload.title).trim() : '';
+  const apiKey = (self.getConfigValue('lastfmApiKey', '') || '').trim();
+  if (!apiKey) {
+    return Promise.reject('Last.fm API key not configured');
+  }
+
+  const artistChapter = artist
+    ? self.fetchLastFmArtistText(artist, apiKey)
+    : Promise.resolve(emptyPlaybackChapter(''));
+  const albumChapter = artist && album
+    ? self.fetchLastFmAlbumText(artist, album, apiKey)
+    : Promise.resolve(emptyPlaybackChapter(album));
+  const trackChapter = artist && title
+    ? self.fetchLastFmTrackText(artist, title, apiKey)
+    : Promise.resolve(emptyPlaybackChapter(title));
+
+  return Promise.all([artistChapter, albumChapter, trackChapter]).then(function (chapters) {
+    return {
+      artist: chapters[0],
+      album: chapters[1],
+      track: chapters[2]
+    };
   });
 };

@@ -44,7 +44,7 @@ On open: send `40`, then `42["subscribe","pushState"]`. Heartbeat every ~25s: se
 | Use case | Transport | Endpoint / wire format |
 |----------|-----------|-------------------------|
 | One-shot playback start (search + queue) | **REST** | `GET /api/v1/search`, `POST /api/v1/replaceAndPlay` |
-| Custom plugin features (similar / recent albums, popularity) | **REST** | `GET /api/v1/pluginEndpoint?endpoint=…` for similar and recent; `POST /api/v1/pluginEndpoint` for `album_popularity` |
+| Custom plugin features (similar / recent albums, popularity, playback text) | **REST** | `GET /api/v1/pluginEndpoint?endpoint=…` for similar and recent; `POST /api/v1/pluginEndpoint` for `album_popularity` and `playback_info` |
 | Initial now-playing when UI connects | **REST** | `GET /api/v1/getState` |
 | Live now-playing updates (overlay, Media Session) | **WebSocket** | Subscribe `pushState`, handle event `pushState` |
 | Play / next / previous (simple commands) | **REST** | `GET /api/v1/commands/?cmd=play\|next\|prev` |
@@ -82,6 +82,9 @@ Requires plugin **enabled** under Plugins → User Interface → Album Tools.
 | `similar_albums` | Track **currently playing** with artist; not webradio/airplay | `{ success, data: { currentArtist, currentAlbum, albums[], matchRate } }` |
 | `recently_added_albums` | MPD library; no playback required | `{ success, data: { albums[] } }` |
 | `album_popularity` (POST) | Plugin 1.3.1+, Last.fm key, switch on, album listeners at or above the minimum | `{ success, data: { enabled, artist, album, albumListeners, tracks[] } }` |
+| `playback_info` (POST) | Plugin 1.3.2+, Last.fm key. Called only when the playback info icon is clicked | `{ success, data: { artist: { name, text }, album: { name, text }, track: { name, text } } }` |
+
+`playback_info` body is `{ endpoint: "playback_info", data: { artist, album, title } }`. Fetch `artist.getInfo`, `album.getInfo`, and `track.getInfo` in parallel. Artist text is `bio.content`, or `bio.summary` when the long text is empty. Album text is `wiki.content`, or `wiki.summary` when the long text is empty. Track text is `wiki.summary` only. Strip HTML before returning. Skip the album call when `album` is empty, and the track call when `title` is empty. One failed chapter stays empty and does not clear the others. A missing API key rejects with `"Last.fm API key not configured"`. Do not use the shared secret or the fallback key.
 
 `album_popularity` body is `{ endpoint: "album_popularity", data: { artist, album, titles? } }`. Volumio passes `data` into the plugin method. `titles` are the track names shown in the library. Look those up with `track.getInfo` and return that requested title, because Last.fm's `album.getInfo` list can use a different name (HOPELESSNESS lists "4 Degrees" as "4 Progress"). Without `titles`, score the album listing.
 
@@ -165,7 +168,7 @@ Some setups serve UI on port `80` or `8080` but API on `3000`. Injection into �
 
 ### 7. Programmatic injection into Volumio tab
 
-Match tab URL: `http` only, hostname === Volumio IP, port === `webPort ?? apiPort`. Inject `content_overlay.js`, `content_volumio.js`, and `content_queue_score.js` on the Volumio tab (including hash routes `#/browse` and `#/queue`). Hook `history.pushState` / `popstate` for SPA navigation.
+Match tab URL: `http` only, hostname === Volumio IP, port === `webPort ?? apiPort`. Inject `content_overlay.js`, `content_volumio.js`, `content_queue_score.js`, and `content_playback_info.js` on the Volumio tab (including hash routes `#/browse`, `#/queue`, and `#/playback`). Hook `history.pushState` / `popstate` for SPA navigation.
 
 `content_queue_score.js` draws popularity bars. It only messages the service worker.
 
@@ -173,6 +176,8 @@ Match tab URL: `http` only, hostname === Volumio IP, port === `webPort ?? apiPor
 - **Browse album** (`/browse`): rows are `#browse-page .album__tracks .music-item` after `renderBrowsePage` fills `#browse-page`. `#browse-page` is empty on the library home. Title is `.item__title` (`title` attribute), album `.item__album` or `.header__album`, artist `.item__artist`. When the row album matches `.header__album`, use `.header__artist` so guest credits stay one Last.fm call. Message `getBrowsePopularity` with `{ groups: [{ artist, album, titles }] }`.
 - Insert the browse bar as a **fixed 184px** flex slot immediately before `.item__duration`. The green pill grows with `score` and stays right-aligned inside that slot. A track with no score still gets an empty slot, so the title, album, artist, and duration columns do not shift. A variable-width flex item compresses `.item__info` (`flex: 0 0 calc(100%/3)` per column) and knocks the first rows out of line.
 - Read `chrome.runtime.lastError` at the start of the `sendMessage` callback, before any early return. The paint path must accept both `/queue` and `/browse`. A guard that returns on `!isQueuePath()` drops the browse response and no bars appear. Do not `console.warn` a failed lookup.
+
+`content_playback_info.js` adds the info icon on `/playback` only. The heart is the first control in `#trackButtonBar` (`favourite-track-btn`). Insert a `btn btn-link` with `fa-info-circle` immediately before that heart, and put it back if Volumio redraws the bar. The click messages `getPlaybackInfo`. Background reads `GET /api/v1/getState` and POSTs `playback_info`. The panel has the headlines Artist, Album, and Track, and its body scrolls. A chapter with empty `text` still shows its headline and says Last.fm has no text. Do not fetch on page load.
 
 ### 8. replaceAndPlay without checking response
 
@@ -190,6 +195,7 @@ Reference code POSTs replaceAndPlay but does not verify HTTP status/body. New co
 | `getRecentlyAddedAlbums` | REST pluginEndpoint | Returns full JSON from Volumio |
 | `getQueuePopularity` | REST getQueue + POST `album_popularity` | One call per album. Each queue item gets `popularity` or `null`. Always `{ success: true }` |
 | `getBrowsePopularity` | REST POST `album_popularity` | `{ groups: [{ artist, album, titles }] }` → `{ groups: [{ scores }] }` aligned with `titles`. Misses are `null` |
+| `getPlaybackInfo` | REST getState + POST `playback_info` | No payload. Loads Last.fm text for the current track only after the info icon is clicked |
 | `getAlbumArt` | REST proxy | `{ url }` → data URL or null |
 | `play` | REST commands | Requires WS open in reference impl (see edge case 1) |
 | `next`, `prev` | REST commands | Same |
@@ -223,6 +229,8 @@ Browser extension needs `host_permissions` for `http://*/*` (local Volumio is HT
 - [ ] recently_added with plugin enabled
 - [ ] Popularity bars on `/queue` and on an open album at `/browse`; columns stay aligned on the widest and the missing score
 - [ ] `album_popularity` with `titles` scores a library name that differs from Last.fm's album listing ("4 Degrees")
+- [ ] Playback info icon sits left of the heart on `/playback`, stays off other pages, and loads text only after a click
+- [ ] Artist chapter prefers the long biography, album chapter prefers the long wiki, track chapter shows the short wiki; an empty chapter still has its headline
 - [ ] Plugin switch off, and album under the listener minimum, draw no bars and do not error in the extension list
 - [ ] pause/seek/volume with WS connected; behavior when WS disconnected
 - [ ] Media Session: lid close does not stop Volumio playback
