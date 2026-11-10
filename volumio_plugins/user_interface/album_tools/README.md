@@ -6,12 +6,13 @@ Volumio plugin combining **Similar Albums** and **Recently Added Albums** in one
 
 - **Similar Albums** – Uses Last.fm API to find similar artists/tracks, returns only albums in your MPD library
 - **Recently Added Albums** – Returns albums from MPD library ordered by add date (MPD 0.24+)
+- **Album popularity** – Scores the tracks of one album from Last.fm play counts. The Chrome extension draws those scores on `/queue` and on an album's track list at `/browse`.
 
 ## Requirements
 
 - Volumio 3 with MPD music library
 - SSH access to your Volumio device
-- [Last.fm API key](https://www.last.fm/api/account/create) (free) – for Similar Albums only
+- [Last.fm API key](https://www.last.fm/api/account/create) (free) – for Similar Albums and album popularity. The shared secret is not used.
 
 ## Installation
 
@@ -141,6 +142,8 @@ This creates the target folder automatically. Follow the on-screen prompts for t
 | **Similar artists limit** | Max similar artists from Last.fm | 15 |
 | **Max similar albums to return** | Max albums in similar_albums response | 50 |
 | **Max recently added albums** | Max albums in recently_added_albums response | 20 |
+| **Show Last.fm popularity bars** | Draw a listener bar on each track in the queue and on a browse album | On |
+| **Minimum album listeners** | Albums below this Last.fm listener count get no bars. 0 scores every album | 50 |
 
 ## REST API
 
@@ -171,6 +174,30 @@ Returns albums from MPD library ordered by add date (newest first).
 **Example:** `curl "http://localhost:3000/api/v1/pluginEndpoint?endpoint=recently_added_albums"`
 
 **Response:** `{ success, data: { albums } }`
+
+### Album popularity
+
+```
+POST /api/v1/pluginEndpoint
+```
+
+```json
+{ "endpoint": "album_popularity", "data": { "artist": "Dawuna", "album": "Love's Arp" } }
+```
+
+Returns a score for each track on the album. Pass `titles` with the names shown in the library when you have them. Those names are looked up directly, so a song still scores when Last.fm's own album listing uses a different title. The score compares play counts within that album only. Each play count is padded with 100 phantom plays before the comparison, so a barely played album does not look like it has a huge hit. The number to show on a bar is `listeners`, the absolute Last.fm listener count for that song.
+
+When **Show Last.fm popularity bars** is off, the response is `{ success: true, data: { enabled: false, tracks: [] } }` and Last.fm is not called. When the album's own listener count is below **Minimum album listeners**, the response is `{ success: true, data: { enabled: true, belowThreshold: true, albumListeners, tracks: [] } }`.
+
+**Example:**
+
+```bash
+curl -X POST "http://localhost:3000/api/v1/pluginEndpoint" \
+  -H "Content-Type: application/json" \
+  -d '{"endpoint":"album_popularity","data":{"artist":"Dawuna","album":"Love'\''s Arp"}}'
+```
+
+**Response:** `{ success, data: { enabled, artist, album, albumListeners, tracks: [{ title, playcount, listeners, score }] } }`
 
 ## License
 

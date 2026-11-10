@@ -11,13 +11,14 @@ A Chrome extension that adds **"Play on Volumio"** buttons to [albumoftheyear.or
 - **Works on Volumio tab** – Media Session also controls when the Volumio Web UI tab is open
 - **Similar albums** – On the Volumio browse/playback pages, a "Search similar album" button finds albums similar to the currently playing track (requires Album Tools plugin)
 - **Recently added** – A "Recently added" button shows albums from your MPD library ordered by add date (requires Album Tools plugin)
+- **Popularity bars** – On the Volumio queue (`/queue`) and on an album track list (`/browse`), each song gets a Last.fm listener bar. The bar length is that song's score within the album. The number inside the bar is the listener count (requires Album Tools 1.3.1)
 
 ## Requirements
 
 - **Chrome** (or Chromium-based browser)
 - **Volumio** running on your local network
 - **albumoftheyear.org** – Extension only works on this site
-- **Album Tools Volumio plugin** – Required for Similar Albums and Recently Added features (included in this repo)
+- **Album Tools Volumio plugin** – Required for Similar Albums, Recently Added, and popularity bars (included in this repo). Popularity bars need plugin **1.3.1** or newer.
 
 ## Installation
 
@@ -73,7 +74,7 @@ volumio vrestart
 Then:
 
 1. Enable **Plugins → User Interface → Album Tools**
-2. Set a [Last.fm API key](https://www.last.fm/api/account/create) in the plugin settings (for Similar Albums)
+2. Set a [Last.fm API key](https://www.last.fm/api/account/create) in the plugin settings (for Similar Albums and popularity bars). The shared secret is not used.
 3. Verify: `curl "http://localhost:3000/api/v1/pluginEndpoint?endpoint=recently_added_albums"`
 
 Full details, update instructions, and API reference: [volumio_plugins/user_interface/album_tools/README.md](volumio_plugins/user_interface/album_tools/README.md).
@@ -98,6 +99,7 @@ Full details, update instructions, and API reference: [volumio_plugins/user_inte
 - **Now playing** – Use the floating overlay or OS media controls (play, pause, next, previous, seek)
 - **Similar albums** – Open the Volumio Web UI, go to **Browse** (`/browse`) or **Playback** (`/playback`), play a track, then click **Search similar album**. A modal lists similar albums from your library; click a cover to play.
 - **Recently added** – On the same Volumio pages, click **Recently added** to see albums from your library ordered by add date; click a cover to play.
+- **Popularity bars** – Open **Queue** (`/queue`) or an album on **Browse** (`/browse`). Each track shows a green bar just before the duration. Hover the bar for the Last.fm play count. In the plugin settings, **Show Last.fm popularity bars** turns the feature off, and **Minimum album listeners** skips albums below that listener count (default 50). A song Last.fm does not know keeps an empty slot so the other columns stay aligned.
 
 ## Supported Pages
 

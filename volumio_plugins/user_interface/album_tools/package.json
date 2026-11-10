@@ -1,7 +1,7 @@
 {
   "name": "album_tools",
-  "version": "1.2.0",
-  "description": "Album Tools: Similar Albums and Recently Added Albums. Uses Last.fm API and MPD library.",
+  "version": "1.3.1",
+  "description": "Album Tools: Similar Albums, Recently Added Albums, and queue popularity bars. Uses Last.fm API and MPD library.",
   "main": "index.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1"
@@ -14,8 +14,8 @@
     "plugin_type": "user_interface",
     "architectures": ["amd64", "armhf", "arm"],
     "os": ["buster", "bullseye", "bookworm"],
-    "details": "Similar Albums (Last.fm) and Recently Added Albums (MPD). Two REST endpoints for album discovery.",
-    "changelog": "1.2.0 Read the ByteFM player cover from the song-history websocket. The HTTP song list is blocked on the device, so Volumio was left without the cover the player shows."
+    "details": "Similar Albums (Last.fm), Recently Added Albums (MPD), and Last.fm popularity bars for the play queue.",
+    "changelog": "1.3.1 Score the track titles reported by the library, so a song still gets a bar when Last.fm's album listing uses a different name. 1.3.0 Add Last.fm popularity bars for the play queue. A setting turns them on, and albums below a listener minimum are left unscored."
   },
   "engines": {
     "node": ">=14",

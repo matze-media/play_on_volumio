@@ -14,5 +14,13 @@
   "maxRecentlyAddedAlbums": {
     "type": "number",
     "value": 20
+  },
+  "popularityBarEnabled": {
+    "type": "boolean",
+    "value": true
+  },
+  "minAlbumListeners": {
+    "type": "number",
+    "value": 50
   }
 }

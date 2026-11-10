@@ -1,0 +1,229 @@
+---
+description: Volumio REST API, WebSocket (Socket.IO), Album Tools plugin — usage patterns and edge cases (from play-on-volumio-extension)
+alwaysApply: true
+---
+
+# Volumio API integration guide
+
+Reference implementation: extension **background service worker** talks to Volumio; **content scripts** never call Volumio directly (except same-origin Volumio tab UI). Centralize network I/O in one place (service worker / backend).
+
+Official docs: [Volumio Developers](https://developers.volumio.com/) — REST under API; real-time state via Socket.IO on the **same host/port as the REST API** (not the optional Web UI port).
+
+---
+
+## Connection settings
+
+| Setting | Purpose |
+|---------|---------|
+| **Volumio IP** | LAN hostname or IP |
+| **API port** (`volumioApiPort`, default `3000`) | REST **and** WebSocket |
+| **Web UI port** (`volumioWebPort`, optional) | Only for detecting/injecting into the Volumio **browser tab** (`http://ip` or `http://ip:8080`). Does **not** change API/WS URLs |
+
+**Base URL helper:**
+
+```javascript
+const HTTP_DEFAULT_PORT = 80;
+function getBaseUrl(ip, apiPort) {
+  return apiPort === HTTP_DEFAULT_PORT ? `http://${ip}` : `http://${ip}:${apiPort}`;
+}
+```
+
+**WebSocket URL (Socket.IO EIO=3):**
+
+```javascript
+const wsPort = apiPort === HTTP_DEFAULT_PORT ? "" : `:${apiPort}`;
+const url = `ws://${ip}${wsPort}/socket.io/?EIO=3&transport=websocket`;
+```
+
+On open: send `40`, then `42["subscribe","pushState"]`. Heartbeat every ~25s: send `2`. Incoming events: frames starting with `42` + JSON array `[eventName, payload]`.
+
+---
+
+## When to use REST vs WebSocket
+
+| Use case | Transport | Endpoint / wire format |
+|----------|-----------|-------------------------|
+| One-shot playback start (search + queue) | **REST** | `GET /api/v1/search`, `POST /api/v1/replaceAndPlay` |
+| Custom plugin features (similar / recent albums, popularity) | **REST** | `GET /api/v1/pluginEndpoint?endpoint=…` for similar and recent; `POST /api/v1/pluginEndpoint` for `album_popularity` |
+| Initial now-playing when UI connects | **REST** | `GET /api/v1/getState` |
+| Live now-playing updates (overlay, Media Session) | **WebSocket** | Subscribe `pushState`, handle event `pushState` |
+| Play / next / previous (simple commands) | **REST** | `GET /api/v1/commands/?cmd=play\|next\|prev` |
+| Pause, volume, seek | **WebSocket** | `42["pause",{}]`, `42["volume",N]`, `42["seek",seconds]` |
+| Album art from Volumio paths | **REST** (proxied) | `GET` relative `/albumart?…` under base URL |
+
+**Rule of thumb:** state **subscription** → WebSocket; **commands that change queue from search results** → REST; **transport-style transport controls** (pause/volume/seek) → WebSocket in this codebase.
+
+---
+
+## REST API details
+
+### Search + play album or track
+
+1. `GET ${baseUrl}/api/v1/search?query=${encodeURIComponent(query)}`
+2. Collect items with `type === "song"` from `data.navigation.lists[].items[]`
+3. `POST ${baseUrl}/api/v1/replaceAndPlay` with `Content-Type: application/json`:
+
+```json
+{ "item": { …song… }, "list": [ …all songs… ], "index": 0 }
+```
+
+**Edge cases:**
+
+- Empty search → show error; do not POST.
+- **playTrack:** fuzzy match title (exact, includes, or reverse includes); fallback to first song.
+- **playAlbum:** use first song in flattened list (library order from search, not guaranteed album track order).
+
+### Plugin endpoints (Album Tools plugin)
+
+Requires plugin **enabled** under Plugins → User Interface → Album Tools.
+
+| Endpoint query | When it works | Response shape |
+|----------------|---------------|----------------|
+| `similar_albums` | Track **currently playing** with artist; not webradio/airplay | `{ success, data: { currentArtist, currentAlbum, albums[], matchRate } }` |
+| `recently_added_albums` | MPD library; no playback required | `{ success, data: { albums[] } }` |
+| `album_popularity` (POST) | Plugin 1.3.1+, Last.fm key, switch on, album listeners at or above the minimum | `{ success, data: { enabled, artist, album, albumListeners, tracks[] } }` |
+
+`album_popularity` body is `{ endpoint: "album_popularity", data: { artist, album, titles? } }`. Volumio passes `data` into the plugin method. `titles` are the track names shown in the library. Look those up with `track.getInfo` and return that requested title, because Last.fm's `album.getInfo` list can use a different name (HOPELESSNESS lists "4 Degrees" as "4 Progress"). Without `titles`, score the album listing.
+
+Score tracks only against each other on that album. `adjusted = playcount + 100`, `score = round(100 * adjusted / maxAdjustedOnAlbum)`. The bar label is `listeners`. The tooltip is `playcount`. Do not mix in `userloved`. Do not send the Last.fm shared secret. A missing API key rejects with `"Last.fm API key not configured"`. The hardcoded fallback key in `lookupLastFmTrack` is not for popularity.
+
+Switch off (`popularityBarEnabled`, default on): return `{ enabled: false, tracks: [] }` and do not call Last.fm. Album listeners below `minAlbumListeners` (default 50, range 0–1,000,000; this is the album's listener count, not a per-song cutoff): return `{ enabled: true, belowThreshold: true, albumListeners, tracks: [] }` and do not fetch tracks. `0` scores every album Last.fm knows.
+
+Failure strings: `"No valid Plugin REST Endpoint"` → plugin stopped/disabled or older than 1.3.0; `"Last.fm API key not configured"` → plugin settings.
+
+Client should check `response.success` and read `response.data`. The extension treats a failed popularity call as no scores and does not `console.warn` (Chrome lists content-script warnings as extension errors).
+
+### getState (REST)
+
+`GET /api/v1/getState` — same fields as `pushState` payload (artist, album, title, duration, seek, status, volume, albumart). Use for **bootstrap** before WebSocket delivers updates.
+
+### Commands (REST)
+
+`GET /api/v1/commands/?cmd=play|next|prev` — no body. Used for play/next/prev from overlay and Media Session **play** action.
+
+---
+
+## WebSocket command wire format
+
+After connection + subscribe:
+
+```javascript
+ws.send('42["pause",{}]');
+ws.send(`42["volume",${volume0to100}]`);  // number only, not {value: n}
+ws.send(`42["seek",${seekSeconds}]`);      // seconds, integer
+```
+
+**pushState → UI normalization:**
+
+- `albumart`: often relative (`/albumart?…`) → prefix with `getBaseUrl()`.
+- **Seek units:** Volumio `pushState.seek` is typically **milliseconds**; UI progress bars often display `seek / 1000`. **`seek` command uses seconds** — convert when sending.
+- **Duration:** treat as **seconds** in UI (do not divide duration by 1000).
+
+---
+
+## Critical edge cases (must handle in a new project)
+
+### 1. WebSocket gate blocks REST play/next/prev
+
+In the reference `background.js`, handlers for `play`, `next`, and `prev` sit **after** a check `if (!ws || ws.readyState !== OPEN) return error`. Those actions use REST but **still require an open WebSocket**. If WS is down, user sees `"Volumio WebSocket not connected."` even though REST would work.
+
+**Recommendation for new code:** only gate `pause`, `setVolume`, and `seek` on WebSocket; allow `play` / `next` / `prev` via REST when WS is disconnected.
+
+### 2. pause vs play asymmetry
+
+- **pause** → WebSocket only (not REST `commands/?cmd=pause` in this project).
+- **play** → REST `commands/?cmd=play`.
+
+If WS drops, user can resume but not pause via the same paths unless you add REST pause or reconnect WS.
+
+### 3. Media Session + laptop lid / tab hidden
+
+Browsers pause silent “holder” audio and may fire Media Session **pause** when the tab is hidden. Forwarding that to Volumio **stops real playback** on the device.
+
+**Mitigation:** after `visibilitychange` to `hidden`, suppress forwarding pause to Volumio for ~2.5s (`PAUSE_FORWARD_SUPPRESS_MS`). Still update local UI/session state.
+
+Media Session **play** uses REST; **seekto** maps to WebSocket seek (seconds).
+
+### 4. Album art from extension pages
+
+Content pages (e.g. albumoftheyear.org) cannot reliably load Volumio album art (referrer, mixed context). **Proxy in background:**
+
+- Message `getAlbumArt` with `url` (relative or absolute under Volumio base only).
+- `fetch(url, { referrerPolicy: "no-referrer" })` → blob → data URL.
+- Reject URLs not under configured Volumio base (SSRF guard).
+
+### 5. Two ports (API vs Web UI)
+
+Some setups serve UI on port `80` or `8080` but API on `3000`. Injection into “Volumio tab” must match **Web UI port**; all API/WS calls use **API port** only.
+
+### 6. Chrome extension architecture
+
+- **Persistent WebSocket** belongs in the **service worker** (MV3), not in arbitrary content scripts.
+- **pushState** fanout: `chrome.runtime.connect({ name: "volumioOverlay" })` + `port.postMessage({ action: "nowPlaying", data })`.
+- Other actions: `chrome.runtime.sendMessage({ action, … })` with `return true` for async `sendResponse`.
+- Reconnect WS on close (e.g. 5s backoff). Reload WS when IP/port changes in storage.
+
+### 7. Programmatic injection into Volumio tab
+
+Match tab URL: `http` only, hostname === Volumio IP, port === `webPort ?? apiPort`. Inject `content_overlay.js`, `content_volumio.js`, and `content_queue_score.js` on the Volumio tab (including hash routes `#/browse` and `#/queue`). Hook `history.pushState` / `popstate` for SPA navigation.
+
+`content_queue_score.js` draws popularity bars. It only messages the service worker.
+
+- **Queue** (`/queue`): `getQueuePopularity`. Background reads `GET /api/v1/getQueue`, groups by primary artist (text before the first comma) plus album, and calls `album_popularity` once per album with those track titles. Paint an overlay bar on `#itemQueue-N` inside `#playQueueList`. Skip webradio and rows missing artist or album.
+- **Browse album** (`/browse`): rows are `#browse-page .album__tracks .music-item` after `renderBrowsePage` fills `#browse-page`. `#browse-page` is empty on the library home. Title is `.item__title` (`title` attribute), album `.item__album` or `.header__album`, artist `.item__artist`. When the row album matches `.header__album`, use `.header__artist` so guest credits stay one Last.fm call. Message `getBrowsePopularity` with `{ groups: [{ artist, album, titles }] }`.
+- Insert the browse bar as a **fixed 184px** flex slot immediately before `.item__duration`. The green pill grows with `score` and stays right-aligned inside that slot. A track with no score still gets an empty slot, so the title, album, artist, and duration columns do not shift. A variable-width flex item compresses `.item__info` (`flex: 0 0 calc(100%/3)` per column) and knocks the first rows out of line.
+- Read `chrome.runtime.lastError` at the start of the `sendMessage` callback, before any early return. The paint path must accept both `/queue` and `/browse`. A guard that returns on `!isQueuePath()` drops the browse response and no bars appear. Do not `console.warn` a failed lookup.
+
+### 8. replaceAndPlay without checking response
+
+Reference code POSTs replaceAndPlay but does not verify HTTP status/body. New code should check `res.ok` and surface Volumio errors.
+
+---
+
+## Message action catalog (extension → background)
+
+| action | Transport | Notes |
+|--------|-----------|--------|
+| `playAlbum` | REST search + replaceAndPlay | `{ artist, album }` |
+| `playTrack` | REST search + replaceAndPlay | `{ artist, album, track }` |
+| `getSimilarAlbums` | REST pluginEndpoint | Returns full JSON from Volumio |
+| `getRecentlyAddedAlbums` | REST pluginEndpoint | Returns full JSON from Volumio |
+| `getQueuePopularity` | REST getQueue + POST `album_popularity` | One call per album. Each queue item gets `popularity` or `null`. Always `{ success: true }` |
+| `getBrowsePopularity` | REST POST `album_popularity` | `{ groups: [{ artist, album, titles }] }` → `{ groups: [{ scores }] }` aligned with `titles`. Misses are `null` |
+| `getAlbumArt` | REST proxy | `{ url }` → data URL or null |
+| `play` | REST commands | Requires WS open in reference impl (see edge case 1) |
+| `next`, `prev` | REST commands | Same |
+| `pause` | WebSocket | |
+| `setVolume` | WebSocket | `{ value: 0–100 }` |
+| `seek` | WebSocket | `{ value: seconds }` |
+
+---
+
+## Album Tools plugin (server side)
+
+Category: `user_interface`. REST registration in plugin `onStart` only.
+
+Install summary: copy to `~/volumio-plugins-sources/album_tools`, `npm install`, on fresh Volumio `mkdir -p /data/plugins/user_interface/album_tools`, `volumio plugin refresh`, `volumio vrestart`, enable plugin, configure Last.fm API key.
+
+See repo `volumio_plugins/user_interface/album_tools/README.md` for full steps.
+
+---
+
+## Security / permissions
+
+Browser extension needs `host_permissions` for `http://*/*` (local Volumio is HTTP). Only talk to configured IP/ports; validate album-art URLs against base URL.
+
+---
+
+## Testing checklist
+
+- [ ] WS connects; overlay updates on track change without refresh
+- [ ] playAlbum from external site with API port 3000 and with UI on port 80
+- [ ] similar_albums with local track playing; error with nothing playing
+- [ ] recently_added with plugin enabled
+- [ ] Popularity bars on `/queue` and on an open album at `/browse`; columns stay aligned on the widest and the missing score
+- [ ] `album_popularity` with `titles` scores a library name that differs from Last.fm's album listing ("4 Degrees")
+- [ ] Plugin switch off, and album under the listener minimum, draw no bars and do not error in the extension list
+- [ ] pause/seek/volume with WS connected; behavior when WS disconnected
+- [ ] Media Session: lid close does not stop Volumio playback
+- [ ] Plugin disabled → pluginEndpoint error surfaced in UI

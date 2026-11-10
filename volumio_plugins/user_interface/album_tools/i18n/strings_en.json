@@ -4,5 +4,8 @@
   "similarArtistsLimit": "Similar artists limit",
   "maxSimilarAlbums": "Max similar albums to return",
   "RECENTLY_ADDED": "Recently Added Albums",
-  "maxRecentlyAddedAlbums": "Max recently added albums"
+  "maxRecentlyAddedAlbums": "Max recently added albums",
+  "POPULARITY": "Popularity",
+  "popularityBarEnabled": "Show Last.fm popularity bars",
+  "minAlbumListeners": "Minimum album listeners"
 }

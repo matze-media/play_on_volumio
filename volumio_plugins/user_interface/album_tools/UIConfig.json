@@ -68,6 +68,38 @@
           "value": 20
         }
       ]
+    },
+    {
+      "id": "section_popularity",
+      "element": "section",
+      "label": "Popularity",
+      "icon": "fa-bar-chart",
+      "onSave": {
+        "type": "controller",
+        "endpoint": "user_interface/album_tools",
+        "method": "updateConfig"
+      },
+      "saveButton": {
+        "label": "Save",
+        "data": ["popularityBarEnabled", "minAlbumListeners"]
+      },
+      "content": [
+        {
+          "id": "popularityBarEnabled",
+          "element": "switch",
+          "label": "Show Last.fm popularity bars",
+          "doc": "Draw a listener bar on each track in the Volumio queue.",
+          "value": true
+        },
+        {
+          "id": "minAlbumListeners",
+          "type": "number",
+          "element": "input",
+          "label": "Minimum album listeners",
+          "doc": "Albums with fewer Last.fm listeners get no bars. 0 scores every album.",
+          "value": 50
+        }
+      ]
     }
   ]
 }

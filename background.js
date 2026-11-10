@@ -264,7 +264,7 @@ function isVolumioTabUrl(url) {
 function injectOverlayIntoVolumioTab(tabId) {
   if (!volumioIp) return;
   chrome.scripting
-    .executeScript({ target: { tabId }, files: ["content_overlay.js", "content_volumio.js"] })
+    .executeScript({ target: { tabId }, files: ["content_overlay.js", "content_volumio.js", "content_queue_score.js"] })
     .then(() => console.log("[Play on Volumio] Injected into tab", tabId))
     .catch((err) => console.warn("[Play on Volumio] Injection failed:", err));
 }
@@ -315,6 +315,171 @@ chrome.runtime.onConnect.addListener((port) => {
 // -----------------------------------------------------------------------------
 // Message Handler: Actions from Content Scripts
 // -----------------------------------------------------------------------------
+function looseTitle(value) {
+  return String(value || "")
+    .toLowerCase()
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/\u2026|\.{3,}/g, "")
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+}
+
+function matchPopularityTrack(queueTitle, tracks, used) {
+  const left = looseTitle(queueTitle);
+  if (!left) return null;
+  let exact = -1;
+  let partial = -1;
+  let partialGap = Infinity;
+  for (let i = 0; i < tracks.length; i++) {
+    if (used.has(i)) continue;
+    const right = looseTitle(tracks[i] && tracks[i].title);
+    if (!right) continue;
+    if (left === right) {
+      exact = i;
+      break;
+    }
+    if (left.includes(right) || right.includes(left)) {
+      const gap = Math.abs(left.length - right.length);
+      if (gap < partialGap) {
+        partialGap = gap;
+        partial = i;
+      }
+    }
+  }
+  const index = exact >= 0 ? exact : partial;
+  if (index < 0) return null;
+  used.add(index);
+  return tracks[index];
+}
+
+function queueItems(body) {
+  if (Array.isArray(body)) return body;
+  if (body && Array.isArray(body.queue)) return body.queue;
+  return [];
+}
+
+function canScoreQueueItem(item) {
+  if (!item || typeof item !== "object") return false;
+  const service = String(item.service || "").toLowerCase();
+  const trackType = String(item.trackType || item.type || "").toLowerCase();
+  if (service === "webradio" || trackType === "webradio") return false;
+  return !!(String(item.artist || "").trim() && String(item.album || "").trim());
+}
+
+function albumLookupArtist(artist) {
+  const name = String(artist || "").trim();
+  const primary = name.split(",")[0].trim();
+  return primary || name;
+}
+
+async function fetchAlbumPopularity(baseUrl, artist, album, titles) {
+  const data = { artist, album };
+  if (Array.isArray(titles) && titles.length) data.titles = titles;
+  const res = await fetch(`${baseUrl}/api/v1/pluginEndpoint`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ endpoint: "album_popularity", data }),
+    signal: AbortSignal.timeout(60000)
+  });
+  let json = null;
+  try {
+    json = await res.json();
+  } catch {
+    json = null;
+  }
+  if (!res.ok || !json || json.success === false) {
+    const error = (json && (json.error || json.message)) || `Popularity failed: ${res.status}`;
+    throw new Error(error);
+  }
+  return json.data || {};
+}
+
+async function getQueuePopularity(baseUrl) {
+  const res = await fetch(`${baseUrl}/api/v1/getQueue`);
+  if (!res.ok) throw new Error(`Queue failed: ${res.status}`);
+  const items = queueItems(await res.json());
+  const albums = [];
+  const albumIndex = new Map();
+  items.forEach((item) => {
+    if (!canScoreQueueItem(item)) return;
+    const artist = albumLookupArtist(item.artist);
+    const album = String(item.album).trim();
+    const key = `${artist.toLowerCase()}\n${album.toLowerCase()}`;
+    const title = String(item.name || item.title || "").trim();
+    if (albumIndex.has(key)) {
+      const known = albums[albumIndex.get(key)];
+      if (title && !known.titles.includes(title)) known.titles.push(title);
+      return;
+    }
+    albumIndex.set(key, albums.length);
+    albums.push({ key, artist, album, titles: title ? [title] : [] });
+  });
+
+  const byAlbum = new Map();
+  await Promise.all(albums.map(async (entry) => {
+    try {
+      const data = await fetchAlbumPopularity(baseUrl, entry.artist, entry.album, entry.titles);
+      byAlbum.set(entry.key, data);
+    } catch (err) {
+      byAlbum.set(entry.key, null);
+    }
+  }));
+
+  const usedByAlbum = new Map();
+  const queue = items.map((item) => {
+    if (!canScoreQueueItem(item)) return { ...item, popularity: null };
+    const key = `${albumLookupArtist(item.artist).toLowerCase()}\n${String(item.album).trim().toLowerCase()}`;
+    const data = byAlbum.get(key);
+    const tracks = data && Array.isArray(data.tracks) ? data.tracks : [];
+    if (!usedByAlbum.has(key)) usedByAlbum.set(key, new Set());
+    const match = matchPopularityTrack(item.name || item.title, tracks, usedByAlbum.get(key));
+    return {
+      ...item,
+      popularity: match
+        ? {
+            title: match.title,
+            playcount: match.playcount,
+            listeners: match.listeners,
+            score: match.score
+          }
+        : null
+    };
+  });
+
+  return { success: true, data: { queue } };
+}
+
+async function getBrowsePopularity(baseUrl, groups) {
+  const requested = Array.isArray(groups) ? groups : [];
+  const scored = await Promise.all(requested.map(async (group) => {
+    const artist = albumLookupArtist(group && group.artist);
+    const album = group && group.album ? String(group.album).trim() : "";
+    const titles = Array.isArray(group && group.titles) ? group.titles : [];
+    if (!artist || !album) return { scores: titles.map(() => null) };
+    try {
+      const data = await fetchAlbumPopularity(baseUrl, artist, album, titles);
+      const tracks = data && Array.isArray(data.tracks) ? data.tracks : [];
+      const used = new Set();
+      return {
+        scores: titles.map((title) => {
+          const match = matchPopularityTrack(title, tracks, used);
+          if (!match) return null;
+          return {
+            title: match.title,
+            playcount: match.playcount,
+            listeners: match.listeners,
+            score: match.score
+          };
+        })
+      };
+    } catch (err) {
+      return { scores: titles.map(() => null) };
+    }
+  }));
+  return { success: true, data: { groups: scored } };
+}
+
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   // --- getAlbumArt: Proxy image fetch to avoid Referrer Policy / mixed content ---
   if (msg.action === "getAlbumArt") {
@@ -444,6 +609,16 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         if (!res.ok) throw new Error(`Recently added albums failed: ${res.status}`);
         const data = await res.json();
         sendResponse(data);
+        return;
+      }
+
+      if (msg.action === "getQueuePopularity") {
+        sendResponse(await getQueuePopularity(baseUrl));
+        return;
+      }
+
+      if (msg.action === "getBrowsePopularity") {
+        sendResponse(await getBrowsePopularity(baseUrl, msg.groups));
         return;
       }
 

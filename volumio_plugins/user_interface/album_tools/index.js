@@ -25,6 +25,26 @@ function resolve() {
   return libQ.resolve();
 }
 
+const PRIOR_PLAYS = 100;
+const LASTFM_INFO_CACHE_MS = 12 * 60 * 60 * 1000;
+const LASTFM_TRACK_CONCURRENCY = 3;
+
+function asBool(value, fallback) {
+  if (value === undefined || value === null || value === '') return fallback;
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'number') return value !== 0;
+  const text = String(value).trim().toLowerCase();
+  if (text === 'true' || text === '1' || text === 'on') return true;
+  if (text === 'false' || text === '0' || text === 'off') return false;
+  return fallback;
+}
+
+function clampAlbumListeners(value, fallback) {
+  const parsed = parseInt(value, 10);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.max(0, Math.min(1000000, parsed));
+}
+
 ControllerAlbumTools.prototype.getConfigPath = function () {
   return this.commandRouter.pluginManager.getPluginConfigurationFile('user_interface', 'album_tools', 'config.json');
 };
@@ -62,6 +82,13 @@ ControllerAlbumTools.prototype.onStart = function () {
     method: 'setBytefmNowPlaying'
   });
 
+  this.commandRouter.addPluginRestEndpoint({
+    endpoint: 'album_popularity',
+    type: 'user_interface',
+    name: 'album_tools',
+    method: 'getAlbumPopularity'
+  });
+
   this.logger.info('[AlbumTools] Plugin started, REST endpoints registered');
   self.bytefmLiveKey = '';
   self.bytefmLiveTimer = setInterval(function () {
@@ -73,6 +100,7 @@ ControllerAlbumTools.prototype.onStart = function () {
 
 function isBytefmPlaybackUri(uri) {
   const value = String(uri || '');
+  if (!/^https?:\/\//i.test(value)) return false;
   if (/byte\.?fm|radiohost\.de/i.test(value)) return true;
   try {
     const host = new URL(value).hostname.toLowerCase();
@@ -90,8 +118,24 @@ const BYTEFM_LOGO = '/albumart?sourceicon=user_interface/album_tools/bytefm-logo
 
 function isBytefmLiveUri(uri) {
   const value = String(uri || '');
+  if (!/^https?:\/\//i.test(value)) return false;
   if (/archiv\.bytefm\.com/i.test(value)) return false;
   return /byte\.fm/i.test(value) || /radiohost\.de/i.test(value);
+}
+
+function currentQueueTrack(sm) {
+  if (!sm || typeof sm.getTrack !== 'function') return null;
+  return sm.getTrack(sm.currentPosition) || null;
+}
+
+function bytefmLiveTrack(sm) {
+  const track = currentQueueTrack(sm);
+  if (!track) return null;
+  if (isBytefmLiveUri(track.uri)) return track;
+  if (String(track.service || '') !== 'webradio') return null;
+  const consumeUri = sm.consumeState && sm.consumeState.uri;
+  if (isBytefmLiveUri(consumeUri)) return track;
+  return null;
 }
 
 const BYTEFM_LIVE_CHANNEL = 'web';
@@ -204,105 +248,107 @@ function writeWsFrame(socket, opcode, payload) {
   socket.write(Buffer.concat([Buffer.from(head), mask, masked]));
 }
 
-// www.byte.fm answers the song list on this socket. The same JSON over HTTP
-// is stopped by a browser check, so the device never saw the cover the player shows.
-function readBytefmSongHistory() {
-  return new Promise(function (resolve, reject) {
-    let settled = false;
-    let timer = null;
-    const done = function (err, value) {
-      if (settled) return;
-      settled = true;
-      if (timer) clearTimeout(timer);
-      if (err) reject(err);
-      else resolve(value);
-    };
-    const req = https.request({
-      host: 'www.byte.fm',
-      path: '/ws/song-history/',
-      method: 'GET',
-      headers: {
-        Connection: 'Upgrade',
-        Upgrade: 'websocket',
-        'Sec-WebSocket-Version': '13',
-        'Sec-WebSocket-Key': crypto.randomBytes(16).toString('base64'),
-        Origin: 'https://www.byte.fm',
-        'User-Agent': BYTEFM_UA
-      },
-      timeout: 8000
-    });
-    timer = setTimeout(function () {
-      req.destroy();
-      done(new Error('ByteFM song history timed out.'));
-    }, 8000);
-    req.on('upgrade', function (res, socket) {
-      let raw = Buffer.alloc(0);
-      let text = Buffer.alloc(0);
-      socket.on('data', function (chunk) {
-        raw = Buffer.concat([raw, chunk]);
-        while (raw.length >= 2) {
-          const opcode = raw[0] & 0x0f;
-          const fin = (raw[0] & 0x80) !== 0;
-          let len = raw[1] & 0x7f;
-          let offset = 2;
-          if (len === 126) {
-            if (raw.length < 4) return;
-            len = raw.readUInt16BE(2);
-            offset = 4;
-          } else if (len === 127) {
-            if (raw.length < 10) return;
-            if (raw.readUInt32BE(2) !== 0 || raw.readUInt32BE(6) > 1000000) {
-              socket.destroy();
-              done(new Error('ByteFM song history frame is too large.'));
-              return;
-            }
-            len = raw.readUInt32BE(6);
-            offset = 10;
-          }
-          if (len > 1000000) {
-            socket.destroy();
-            done(new Error('ByteFM song history frame is too large.'));
+// The ByteFM player keeps this socket open and receives a new message when the
+// song changes. Reading one message and disconnecting left Volumio on the
+// first song, because a later connection often never replaced it.
+function connectBytefmHistory(handlers) {
+  let closed = false;
+  let netSocket = null;
+  const fail = function (err) {
+    if (closed) return;
+    closed = true;
+    if (netSocket) netSocket.destroy();
+    if (handlers.onEnd) handlers.onEnd(err);
+  };
+  const req = https.request({
+    host: 'www.byte.fm',
+    path: '/ws/song-history/',
+    method: 'GET',
+    headers: {
+      Connection: 'Upgrade',
+      Upgrade: 'websocket',
+      'Sec-WebSocket-Version': '13',
+      'Sec-WebSocket-Key': crypto.randomBytes(16).toString('base64'),
+      Origin: 'https://www.byte.fm',
+      'User-Agent': BYTEFM_UA
+    },
+    timeout: 8000
+  });
+  req.on('upgrade', function (res, socket) {
+    req.setTimeout(0);
+    socket.setTimeout(0);
+    netSocket = socket;
+    let raw = Buffer.alloc(0);
+    let text = Buffer.alloc(0);
+    socket.on('data', function (chunk) {
+      if (closed) return;
+      raw = Buffer.concat([raw, chunk]);
+      while (raw.length >= 2) {
+        const opcode = raw[0] & 0x0f;
+        const fin = (raw[0] & 0x80) !== 0;
+        let len = raw[1] & 0x7f;
+        let offset = 2;
+        if (len === 126) {
+          if (raw.length < 4) return;
+          len = raw.readUInt16BE(2);
+          offset = 4;
+        } else if (len === 127) {
+          if (raw.length < 10) return;
+          if (raw.readUInt32BE(2) !== 0 || raw.readUInt32BE(6) > 1000000) {
+            fail(new Error('ByteFM song history frame is too large.'));
             return;
           }
-          if (raw.length < offset + len) return;
-          const body = raw.slice(offset, offset + len);
-          raw = raw.slice(offset + len);
-          if (opcode === 0x9) {
-            writeWsFrame(socket, 0xA, body);
-            continue;
-          }
-          if (opcode === 0x8) {
-            socket.destroy();
-            done(new Error('ByteFM song history closed.'));
-            return;
-          }
-          if (opcode === 0x1 || opcode === 0x0) {
-            text = Buffer.concat([text, body]);
-            if (!fin) continue;
-            socket.destroy();
-            try {
-              done(null, JSON.parse(text.toString('utf8')));
-            } catch (e) {
-              done(e);
-            }
+          len = raw.readUInt32BE(6);
+          offset = 10;
+        }
+        if (len > 1000000) {
+          fail(new Error('ByteFM song history frame is too large.'));
+          return;
+        }
+        if (raw.length < offset + len) return;
+        const body = raw.slice(offset, offset + len);
+        raw = raw.slice(offset + len);
+        if (opcode === 0x9) {
+          writeWsFrame(socket, 0xA, body);
+          continue;
+        }
+        if (opcode === 0x8) {
+          fail(new Error('ByteFM song history closed.'));
+          return;
+        }
+        if (opcode === 0x1 || opcode === 0x0) {
+          text = Buffer.concat([text, body]);
+          if (!fin) continue;
+          const message = text;
+          text = Buffer.alloc(0);
+          try {
+            handlers.onMessage(JSON.parse(message.toString('utf8')));
+          } catch (e) {
+            fail(e);
             return;
           }
         }
-      });
-      socket.on('error', function (err) { done(err); });
-      socket.on('end', function () { done(new Error('ByteFM song history closed.')); });
+      }
     });
-    req.on('response', function (res) {
-      res.resume();
-      done(new Error('ByteFM song history failed: ' + res.statusCode));
-    });
-    req.on('error', function (err) { done(err); });
-    req.on('timeout', function () {
-      req.destroy();
-      done(new Error('ByteFM song history timed out.'));
-    });
-    req.end();
+    socket.on('error', fail);
+    socket.on('end', function () { fail(new Error('ByteFM song history closed.')); });
   });
+  req.on('response', function (res) {
+    res.resume();
+    fail(new Error('ByteFM song history failed: ' + res.statusCode));
+  });
+  req.on('error', fail);
+  req.on('timeout', function () {
+    fail(new Error('ByteFM song history timed out.'));
+  });
+  req.end();
+  return {
+    close: function () {
+      closed = true;
+      if (netSocket) netSocket.destroy();
+      req.destroy();
+    }
+  };
 }
 
 function downloadBytefmCover(url, dest, redirects) {
@@ -413,10 +459,10 @@ ControllerAlbumTools.prototype.applyBytefmNowPlaying = function (data) {
   const self = this;
   const sm = self.commandRouter.stateMachine;
   if (!sm) return { ok: false, error: 'Player is not ready.' };
-  const position = sm.currentPosition;
-  const track = typeof sm.getTrack === 'function' ? sm.getTrack(position) : null;
-  const consumeUri = sm.consumeState && sm.consumeState.uri;
-  if (!track || (!isBytefmPlaybackUri(track.uri) && !isBytefmPlaybackUri(consumeUri))) {
+  const track = currentQueueTrack(sm);
+  // The stream address can stay in consumeState after the queue has moved on
+  // to a library album. Only the queue item decides that ByteFM is playing.
+  if (!track || !isBytefmPlaybackUri(track.uri)) {
     return { ok: false, error: 'ByteFM is not the current item.' };
   }
 
@@ -482,9 +528,6 @@ ControllerAlbumTools.prototype.cacheBytefmCover = function (url, data, onReady) 
     self.bytefmCoverSource = url;
     self.bytefmCoverArt = localBytefmCover(url);
     self.bytefmCoverFetching = '';
-    if (self.bytefmPendingKey && self.bytefmPendingKey.slice(-url.length) === url) {
-      self.bytefmLiveKey = self.bytefmPendingKey;
-    }
     if (typeof onReady === 'function') {
       onReady(self.bytefmCoverArt);
       return;
@@ -502,58 +545,104 @@ ControllerAlbumTools.prototype.cacheBytefmCover = function (url, data, onReady) 
   });
 };
 
+ControllerAlbumTools.prototype.releaseBytefmMetadata = function (sm) {
+  if (!sm || !sm.consumeIgnoreMetadata) return;
+  sm.consumeIgnoreMetadata = false;
+  this.bytefmLiveKey = '';
+  this.bytefmPendingKey = '';
+  const track = currentQueueTrack(sm);
+  if (track && String(track.albumart || '').indexOf('user_interface/album_tools/bytefm') !== -1) {
+    track.albumart = '';
+  }
+  try {
+    sm.pushState();
+  } catch (e) {
+    this.logger.error('[AlbumTools] Could not restore track information: ' + e);
+  }
+};
+
+ControllerAlbumTools.prototype.closeBytefmSocket = function () {
+  if (this.bytefmReconnectTimer) {
+    clearTimeout(this.bytefmReconnectTimer);
+    this.bytefmReconnectTimer = null;
+  }
+  const socket = this.bytefmHistorySocket;
+  this.bytefmHistorySocket = null;
+  this.bytefmHistoryActive = false;
+  if (socket) socket.close();
+};
+
+ControllerAlbumTools.prototype.openBytefmHistorySocket = function () {
+  const self = this;
+  if (self.bytefmHistoryActive) return;
+  self.bytefmHistoryActive = true;
+  const conn = connectBytefmHistory({
+    onMessage: function (data) {
+      self.onBytefmHistory(data);
+    },
+    onEnd: function (err) {
+      if (self.bytefmHistorySocket !== conn) return;
+      self.bytefmHistorySocket = null;
+      self.bytefmHistoryActive = false;
+      if (err && !self.bytefmHistoryWarned) {
+        self.bytefmHistoryWarned = true;
+        self.logger.warn('[AlbumTools] ByteFM song history is blocked (' + (err && err.message ? err.message : err) + '). Using the stream title until it reconnects.');
+      }
+      if (!self.bytefmLiveTimer) return;
+      self.bytefmReconnectTimer = setTimeout(function () {
+        self.bytefmReconnectTimer = null;
+        self.pollBytefmLive();
+      }, 5000);
+    }
+  });
+  self.bytefmHistorySocket = conn;
+};
+
+ControllerAlbumTools.prototype.onBytefmHistory = function (data) {
+  const self = this;
+  const sm = self.commandRouter.stateMachine;
+  if (!sm || sm.currentStatus !== 'play' || !bytefmLiveTrack(sm)) return;
+
+  const tracks = bytefmChannel(data.tracks);
+  const song = splitBytefmTrack(Array.isArray(tracks) ? tracks[0] : '');
+  const show = decodeHtml(bytefmChannel(data.current_show_title));
+  const subtitle = decodeHtml(bytefmChannel(data.current_show_subtitle));
+  const album = show && subtitle ? show + ' – ' + subtitle : show || subtitle || 'ByteFM';
+  const info = {
+    title: song.title || 'ByteFM',
+    artist: song.artist,
+    album: album,
+    albumart: bytefmCover(bytefmChannel(data.artistImageURL)) || bytefmCover(bytefmChannel(data.moderator_image))
+  };
+  const key = [info.artist, info.title, info.album].join('\n');
+  if (key === self.bytefmLiveKey) return;
+  self.bytefmLiveKey = key;
+  self.bytefmPendingKey = info.albumart ? key + '\n' + info.albumart : key;
+  const applied = self.applyBytefmNowPlaying(info);
+  if (!applied || !applied.ok) {
+    self.bytefmLiveKey = '';
+    return;
+  }
+  self.logger.info('[AlbumTools] ByteFM now playing: ' + (info.artist ? info.artist + ' – ' : '') + info.title);
+};
+
 ControllerAlbumTools.prototype.pollBytefmLive = function () {
   const self = this;
-  if (self.bytefmLiveBusy) return;
   const sm = self.commandRouter.stateMachine;
-  if (!sm || sm.currentStatus !== 'play') return;
-  const position = sm.currentPosition;
-  const track = typeof sm.getTrack === 'function' ? sm.getTrack(position) : null;
-  const consumeUri = sm.consumeState && sm.consumeState.uri;
-  if (!isBytefmLiveUri(track && track.uri) && !isBytefmLiveUri(consumeUri)) return;
-
-  self.bytefmLiveBusy = true;
-  readBytefmSongHistory().then(function (data) {
-    const smNow = self.commandRouter.stateMachine;
-    const nowTrack = smNow && typeof smNow.getTrack === 'function' ? smNow.getTrack(smNow.currentPosition) : null;
-    const nowConsume = smNow && smNow.consumeState && smNow.consumeState.uri;
-    if (!smNow || smNow.currentStatus !== 'play') return;
-    if (!isBytefmLiveUri(nowTrack && nowTrack.uri) && !isBytefmLiveUri(nowConsume)) return;
-
-    const tracks = bytefmChannel(data.tracks);
-    const song = splitBytefmTrack(Array.isArray(tracks) ? tracks[0] : '');
-    const show = decodeHtml(bytefmChannel(data.current_show_title));
-    const subtitle = decodeHtml(bytefmChannel(data.current_show_subtitle));
-    const album = show && subtitle ? show + ' – ' + subtitle : show || subtitle || 'ByteFM';
-    const info = {
-      title: song.title || 'ByteFM',
-      artist: song.artist,
-      album: album,
-      albumart: bytefmCover(bytefmChannel(data.artistImageURL)) || bytefmCover(bytefmChannel(data.moderator_image))
-    };
-    const key = [info.artist, info.title, info.album, info.albumart].join('\n');
-    if (key === self.bytefmLiveKey) return;
-    self.bytefmPendingKey = key;
-    const applied = self.applyBytefmNowPlaying(info);
-    if (!applied || !applied.ok) return;
-    if (!info.albumart || self.bytefmCoverSource === info.albumart) self.bytefmLiveKey = key;
-  }).catch(function (err) {
-    if (!self.bytefmHistoryWarned) {
-      self.bytefmHistoryWarned = true;
-      self.logger.warn('[AlbumTools] ByteFM song history is blocked (' + (err && err.message ? err.message : err) + '). Using the stream title for the cover.');
-    }
-    return self.coverFromStreamTitle();
-  }).then(function () {
-    self.bytefmLiveBusy = false;
-  });
+  if (!sm || !bytefmLiveTrack(sm)) {
+    self.closeBytefmSocket();
+    if (sm) self.releaseBytefmMetadata(sm);
+    return;
+  }
+  if (sm.currentStatus !== 'play') return;
+  self.openBytefmHistorySocket();
 };
 
 ControllerAlbumTools.prototype.applyBytefmLiveArt = function (albumart) {
   const sm = this.commandRouter.stateMachine;
   if (!sm || !albumart) return;
-  const track = typeof sm.getTrack === 'function' ? sm.getTrack(sm.currentPosition) : null;
-  const consumeUri = sm.consumeState && sm.consumeState.uri;
-  if (!isBytefmLiveUri(track && track.uri) && !isBytefmLiveUri(consumeUri)) return;
+  if (!bytefmLiveTrack(sm)) return;
+  const track = currentQueueTrack(sm);
   if (track) track.albumart = albumart;
   sm.consumeIgnoreMetadata = false;
   if (sm.consumeState) sm.consumeState.albumart = albumart;
@@ -572,7 +661,7 @@ ControllerAlbumTools.prototype.lookupLastFmTrack = function (artist, track) {
     '&track=' + encodeURIComponent(track) +
     '&api_key=' + encodeURIComponent(apiKey) + '&format=json';
   return new Promise(function (resolve, reject) {
-    http.get({ host: 'ws.audioscrobbler.com', port: 80, path: query }, function (res) {
+    const req = http.get({ host: 'ws.audioscrobbler.com', port: 80, path: query, timeout: 8000 }, function (res) {
       let body = '';
       res.on('data', function (chunk) { body += chunk; });
       res.on('end', function () {
@@ -593,7 +682,11 @@ ControllerAlbumTools.prototype.lookupLastFmTrack = function (artist, track) {
           reject(e);
         }
       });
-    }).on('error', reject);
+    });
+    req.on('error', reject);
+    req.on('timeout', function () {
+      req.destroy(new Error('Last.fm timed out.'));
+    });
   });
 };
 
@@ -601,9 +694,7 @@ ControllerAlbumTools.prototype.coverFromStreamTitle = function () {
   const self = this;
   const sm = self.commandRouter.stateMachine;
   if (!sm || sm.currentStatus !== 'play') return Promise.resolve();
-  const track = typeof sm.getTrack === 'function' ? sm.getTrack(sm.currentPosition) : null;
-  const consumeUri = sm.consumeState && sm.consumeState.uri;
-  if (!isBytefmLiveUri(track && track.uri) && !isBytefmLiveUri(consumeUri)) return Promise.resolve();
+  if (!bytefmLiveTrack(sm)) return Promise.resolve();
   if (sm.consumeIgnoreMetadata) sm.consumeIgnoreMetadata = false;
 
   const song = songFromPlayback(sm.consumeState);
@@ -664,9 +755,11 @@ ControllerAlbumTools.prototype.onStop = function () {
     clearInterval(this.bytefmLiveTimer);
     this.bytefmLiveTimer = null;
   }
+  this.closeBytefmSocket();
   this.commandRouter.removePluginRestEndpoint({ endpoint: 'similar_albums' });
   this.commandRouter.removePluginRestEndpoint({ endpoint: 'recently_added_albums' });
   this.commandRouter.removePluginRestEndpoint({ endpoint: 'bytefm_now_playing' });
+  this.commandRouter.removePluginRestEndpoint({ endpoint: 'album_popularity' });
   return resolve();
 };
 
@@ -736,12 +829,23 @@ ControllerAlbumTools.prototype.getUIConfig = function () {
       const limit = getConfigVal('similarArtistsLimit', 15) ?? 15;
       const maxSimilar = getConfigVal('maxSimilarAlbums', 50) ?? 50;
       const maxRecent = getConfigVal('maxRecentlyAddedAlbums', 20) ?? 20;
+      const popularityEnabled = asBool(getConfigVal('popularityBarEnabled', true), true);
+      const minAlbumListeners = clampAlbumListeners(getConfigVal('minAlbumListeners', 50), 50);
       uiconf.sections[0].content[0].value = apiKey;
       uiconf.sections[0].content[1].value = limit;
       uiconf.sections[0].content[2].value = maxSimilar;
       uiconf.sections[1].content[0].value = maxRecent;
+      let popularitySection = null;
+      for (let i = 0; i < uiconf.sections.length; i++) {
+        if (uiconf.sections[i].id === 'section_popularity') popularitySection = uiconf.sections[i];
+      }
+      if (popularitySection && popularitySection.content && popularitySection.content.length >= 2) {
+        popularitySection.content[0].value = popularityEnabled;
+        popularitySection.content[1].value = minAlbumListeners;
+      }
       self.logger.info('[AlbumTools] getUIConfig: returning lastfmApiKey=' + (apiKey ? '(len=' + apiKey.length + ')' : '(empty)') +
-        ', similarArtistsLimit=' + limit + ', maxSimilarAlbums=' + maxSimilar + ', maxRecentlyAddedAlbums=' + maxRecent);
+        ', similarArtistsLimit=' + limit + ', maxSimilarAlbums=' + maxSimilar + ', maxRecentlyAddedAlbums=' + maxRecent +
+        ', popularityBarEnabled=' + popularityEnabled + ', minAlbumListeners=' + minAlbumListeners);
       defer.resolve(uiconf);
     })
     .fail(function (err) {
@@ -794,11 +898,16 @@ ControllerAlbumTools.prototype.updateConfig = function (data) {
   const maxSimilar = getVal(d.maxSimilarAlbums);
   const d2 = data.section_recently_added || data;
   const maxRecent = getVal(d2.maxRecentlyAddedAlbums);
+  const d3 = data.section_popularity || data;
+  const popularityEnabled = getVal(d3.popularityBarEnabled);
+  const minAlbumListeners = getVal(d3.minAlbumListeners);
 
   self.logger.info('[AlbumTools] updateConfig: extracted lastfmApiKey=' + (apiKey !== undefined ? '(set)' : '(none)') +
     ', similarArtistsLimit=' + (limit !== undefined ? limit : '(none)') +
     ', maxSimilarAlbums=' + (maxSimilar !== undefined ? maxSimilar : '(none)') +
-    ', maxRecentlyAddedAlbums=' + (maxRecent !== undefined ? maxRecent : '(none)'));
+    ', maxRecentlyAddedAlbums=' + (maxRecent !== undefined ? maxRecent : '(none)') +
+    ', popularityBarEnabled=' + (popularityEnabled !== undefined ? popularityEnabled : '(none)') +
+    ', minAlbumListeners=' + (minAlbumListeners !== undefined ? minAlbumListeners : '(none)'));
 
   try {
     let current = {};
@@ -818,7 +927,19 @@ ControllerAlbumTools.prototype.updateConfig = function (data) {
       lastfmApiKey: { type: 'string', value: apiKey !== undefined ? String(apiKey || '') : (getCurrentVal('lastfmApiKey') ?? '') },
       similarArtistsLimit: { type: 'number', value: limit !== undefined ? Math.max(5, Math.min(50, parseInt(limit, 10) || 15)) : (getCurrentVal('similarArtistsLimit') ?? 15) },
       maxSimilarAlbums: { type: 'number', value: maxSimilar !== undefined ? Math.max(1, Math.min(200, parseInt(maxSimilar, 10) || 50)) : (getCurrentVal('maxSimilarAlbums') ?? 50) },
-      maxRecentlyAddedAlbums: { type: 'number', value: maxRecent !== undefined ? Math.max(1, Math.min(200, parseInt(maxRecent, 10) || 20)) : (getCurrentVal('maxRecentlyAddedAlbums') ?? 20) }
+      maxRecentlyAddedAlbums: { type: 'number', value: maxRecent !== undefined ? Math.max(1, Math.min(200, parseInt(maxRecent, 10) || 20)) : (getCurrentVal('maxRecentlyAddedAlbums') ?? 20) },
+      popularityBarEnabled: {
+        type: 'boolean',
+        value: popularityEnabled !== undefined
+          ? asBool(popularityEnabled, true)
+          : asBool(getCurrentVal('popularityBarEnabled'), true)
+      },
+      minAlbumListeners: {
+        type: 'number',
+        value: minAlbumListeners !== undefined
+          ? clampAlbumListeners(minAlbumListeners, 50)
+          : clampAlbumListeners(getCurrentVal('minAlbumListeners'), 50)
+      }
     };
     const dirPath = path.dirname(configPath);
     self.logger.info('[AlbumTools] updateConfig: ensuring dir ' + dirPath);
@@ -846,7 +967,9 @@ ControllerAlbumTools.prototype.updateConfig = function (data) {
     self.config.loadFile(configPath);
     self.logger.info('[AlbumTools] updateConfig: toWrite lastfmApiKey=' + (toWrite.lastfmApiKey.value ? '(len=' + toWrite.lastfmApiKey.value.length + ')' : '(empty)') +
       ', similarArtistsLimit=' + toWrite.similarArtistsLimit.value + ', maxSimilarAlbums=' + toWrite.maxSimilarAlbums.value +
-      ', maxRecentlyAddedAlbums=' + toWrite.maxRecentlyAddedAlbums.value);
+      ', maxRecentlyAddedAlbums=' + toWrite.maxRecentlyAddedAlbums.value +
+      ', popularityBarEnabled=' + toWrite.popularityBarEnabled.value +
+      ', minAlbumListeners=' + toWrite.minAlbumListeners.value);
 
     self.commandRouter.pushToastMessage('success', 'Album Tools', 'Configuration saved');
 
@@ -1286,4 +1409,254 @@ ControllerAlbumTools.prototype.searchFor = function (lines, start, key) {
     }
   }
   return null;
+};
+
+// -----------------------------------------------------------------------------
+// Album popularity (Last.fm play counts, scored within one album)
+// -----------------------------------------------------------------------------
+
+ControllerAlbumTools.prototype.readLastFmCache = function (key) {
+  if (!this.lastFmInfoCache) return null;
+  const hit = this.lastFmInfoCache[key];
+  if (!hit) return null;
+  if (Date.now() - hit.at > LASTFM_INFO_CACHE_MS) {
+    delete this.lastFmInfoCache[key];
+    return null;
+  }
+  return hit;
+};
+
+ControllerAlbumTools.prototype.writeLastFmCache = function (key, value) {
+  if (!this.lastFmInfoCache) this.lastFmInfoCache = {};
+  this.lastFmInfoCache[key] = { at: Date.now(), value: value };
+};
+
+ControllerAlbumTools.prototype.lastFmGet = function (query) {
+  return new Promise(function (resolve, reject) {
+    const req = http.get({
+      host: 'ws.audioscrobbler.com',
+      port: 80,
+      path: query,
+      timeout: 8000
+    }, function (res) {
+      let body = '';
+      res.on('data', function (chunk) { body += chunk; });
+      res.on('end', function () {
+        try {
+          const json = JSON.parse(body);
+          if (json.error) {
+            reject(new Error(json.message || 'Last.fm error'));
+            return;
+          }
+          resolve(json);
+        } catch (e) {
+          reject(e);
+        }
+      });
+    });
+    req.on('error', reject);
+    req.on('timeout', function () {
+      req.destroy(new Error('Last.fm timed out.'));
+    });
+  });
+};
+
+function lastFmTrackArtist(track, fallback) {
+  if (!track || track.artist == null) return fallback;
+  if (typeof track.artist === 'string') return track.artist;
+  return track.artist.name || fallback;
+}
+
+function scoreAlbumTracks(tracks) {
+  let maxAdjusted = 0;
+  for (let i = 0; i < tracks.length; i++) {
+    maxAdjusted = Math.max(maxAdjusted, tracks[i].playcount + PRIOR_PLAYS);
+  }
+  if (maxAdjusted <= 0) return [];
+  return tracks.map(function (track) {
+    return {
+      title: track.title,
+      playcount: track.playcount,
+      listeners: track.listeners,
+      score: Math.round(100 * (track.playcount + PRIOR_PLAYS) / maxAdjusted)
+    };
+  });
+}
+
+function mapWithConcurrency(items, limit, fn) {
+  const results = new Array(items.length);
+  let next = 0;
+  let active = 0;
+  return new Promise(function (resolve, reject) {
+    if (!items.length) {
+      resolve(results);
+      return;
+    }
+    let failed = false;
+    function pump() {
+      if (failed) return;
+      if (next >= items.length && active === 0) {
+        resolve(results);
+        return;
+      }
+      while (active < limit && next < items.length) {
+        const index = next++;
+        active++;
+        Promise.resolve(fn(items[index], index)).then(function (value) {
+          results[index] = value;
+          active--;
+          pump();
+        }, function (err) {
+          failed = true;
+          reject(err);
+        });
+      }
+    }
+    pump();
+  });
+}
+
+ControllerAlbumTools.prototype.fetchLastFmAlbum = function (artist, album, apiKey) {
+  const self = this;
+  const key = 'album\n' + artist.toLowerCase() + '\n' + album.toLowerCase();
+  const cached = self.readLastFmCache(key);
+  if (cached) return Promise.resolve(cached.value);
+
+  const query = '/2.0/?method=album.getInfo&artist=' + encodeURIComponent(artist) +
+    '&album=' + encodeURIComponent(album) +
+    '&autocorrect=1&api_key=' + encodeURIComponent(apiKey) + '&format=json';
+
+  return self.lastFmGet(query).then(function (json) {
+    const info = json && json.album;
+    if (!info || !info.name) {
+      throw new Error('Last.fm has no album for this artist');
+    }
+    let list = info.tracks && info.tracks.track;
+    if (!list) list = [];
+    if (!Array.isArray(list)) list = [list];
+    const listeners = parseInt(info.listeners, 10);
+    const value = {
+      listeners: Number.isFinite(listeners) ? listeners : 0,
+      tracks: list.map(function (track) {
+        return {
+          title: track && track.name ? String(track.name) : '',
+          artist: lastFmTrackArtist(track, artist)
+        };
+      }).filter(function (track) { return track.title; })
+    };
+    self.writeLastFmCache(key, value);
+    return value;
+  });
+};
+
+ControllerAlbumTools.prototype.fetchLastFmTrackInfo = function (artist, title, apiKey) {
+  const self = this;
+  const key = 'track\n' + artist.toLowerCase() + '\n' + title.toLowerCase();
+  const cached = self.readLastFmCache(key);
+  if (cached) return Promise.resolve(cached.value);
+
+  const query = '/2.0/?method=track.getInfo&artist=' + encodeURIComponent(artist) +
+    '&track=' + encodeURIComponent(title) +
+    '&autocorrect=1&api_key=' + encodeURIComponent(apiKey) + '&format=json';
+
+  return self.lastFmGet(query).then(function (json) {
+    const track = json && json.track;
+    const playcount = track ? parseInt(track.playcount, 10) : NaN;
+    const listeners = track ? parseInt(track.listeners, 10) : NaN;
+    const value = Number.isFinite(playcount) ? {
+      title: track.name || title,
+      playcount: playcount,
+      listeners: Number.isFinite(listeners) ? listeners : 0
+    } : null;
+    self.writeLastFmCache(key, value);
+    return value;
+  }).catch(function (err) {
+    self.logger.info('[AlbumTools] track.getInfo failed for "' + artist + '" / "' + title + '": ' + (err && err.message ? err.message : err));
+    return null;
+  });
+};
+
+function requestedPopularityTracks(payload, artist) {
+  if (!payload || !Array.isArray(payload.titles)) return null;
+  const seen = new Set();
+  const tracks = [];
+  payload.titles.forEach(function (title) {
+    const name = title == null ? '' : String(title).trim();
+    const key = name.toLowerCase();
+    if (!name || seen.has(key)) return;
+    seen.add(key);
+    tracks.push({ title: name, artist: artist });
+  });
+  return tracks.length ? tracks : null;
+}
+
+ControllerAlbumTools.prototype.getAlbumPopularity = function (data) {
+  const self = this;
+  self.configFile = self.getConfigPath();
+  if (!self.config) self.config = new vConf();
+  try {
+    self.config.loadFile(self.configFile);
+  } catch (e) {
+    self.logger.info('[AlbumTools] loadFile error: ' + e.message);
+  }
+
+  if (!asBool(self.getConfigValue('popularityBarEnabled', true), true)) {
+    return Promise.resolve({ enabled: false, tracks: [] });
+  }
+
+  const payload = data || {};
+  const artist = payload.artist ? String(payload.artist).trim() : '';
+  const album = payload.album ? String(payload.album).trim() : '';
+  if (!artist || !album) {
+    return Promise.reject('Artist and album are required');
+  }
+
+  const apiKey = (self.getConfigValue('lastfmApiKey', '') || '').trim();
+  if (!apiKey) {
+    return Promise.reject('Last.fm API key not configured');
+  }
+
+  const minAlbumListeners = clampAlbumListeners(self.getConfigValue('minAlbumListeners', 50), 50);
+
+  return self.fetchLastFmAlbum(artist, album, apiKey).then(function (info) {
+    if (info.listeners < minAlbumListeners) {
+      self.logger.info('[AlbumTools] Popularity skipped for "' + artist + '" / "' + album +
+        '": listeners=' + info.listeners + ' below ' + minAlbumListeners);
+      return {
+        enabled: true,
+        belowThreshold: true,
+        artist: artist,
+        album: album,
+        albumListeners: info.listeners,
+        tracks: []
+      };
+    }
+
+    const lookup = requestedPopularityTracks(payload, artist) || info.tracks;
+    return mapWithConcurrency(lookup, LASTFM_TRACK_CONCURRENCY, function (track) {
+      return self.fetchLastFmTrackInfo(track.artist || artist, track.title, apiKey).then(function (info) {
+        if (!info) return null;
+        return {
+          title: track.title,
+          playcount: info.playcount,
+          listeners: info.listeners
+        };
+      });
+    }).then(function (results) {
+      const known = [];
+      for (let i = 0; i < results.length; i++) {
+        if (results[i]) known.push(results[i]);
+      }
+      const tracks = scoreAlbumTracks(known);
+      self.logger.info('[AlbumTools] Popularity "' + artist + '" / "' + album + '": ' +
+        tracks.length + '/' + info.tracks.length + ' tracks, albumListeners=' + info.listeners);
+      return {
+        enabled: true,
+        artist: artist,
+        album: album,
+        albumListeners: info.listeners,
+        tracks: tracks
+      };
+    });
+  });
 };
